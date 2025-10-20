@@ -51,7 +51,8 @@ POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'postgres')
 
 # PostgreSQL optimization parameters (configurable via environment variables)
 # USE_UNLOGGED_TABLE: when True, uses UNLOGGED TABLE (2-3x faster, DATA LOSS on crash)
-USE_UNLOGGED_TABLE = os.getenv('USE_UNLOGGED_TABLE', 'true').lower() == 'true'
+# Default: false (safe LOGGED tables for production)
+USE_UNLOGGED_TABLE = os.getenv('USE_UNLOGGED_TABLE', 'false').lower() == 'true'
 
 # Global Redis connection pool (reuses connections across workers)
 _redis_pool = None
