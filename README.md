@@ -69,9 +69,14 @@ USE_UNLOGGED_TABLE=false python main.py
 
 ## Included Benchmarks
 
-1. **Tax Code Generation + Hash Computation** - Generate 6M tax codes and compute SHA256 hashes in Python (multiprocessing). Results stored in memory as (tax_code, hash) tuples.
-2. **KeyDB Write** - Write pre-computed (tax_code, hash) tuples to KeyDB using pipelined batch operations
-3. **PostgreSQL Write** - Insert pre-computed (tax_code, hash) tuples into PostgreSQL using COPY FROM STDIN with optimized index management
+**New Architecture** - Tax codes are generated once, stored in PostgreSQL, then read for hash computation:
+
+1. **Tax Code Generation** - Generate 6M tax codes in parallel (no hash computation). Stored in memory.
+2. **BENCHMARK 1bis: Write to PostgreSQL cf_raw** - Write tax codes to PostgreSQL `cf_raw` table (no hashes, just raw data)
+3. **Read from PostgreSQL** - Read tax codes from `cf_raw` table for subsequent benchmarks
+4. **BENCHMARK 2: Hash Computation + KeyDB Write** - Read tax codes, compute SHA256 hashes, write to KeyDB
+5. **BENCHMARK 3: Hash Computation + PostgreSQL Write** - Read tax codes, compute SHA256 hashes, write to PostgreSQL `codici_fiscali` table
+6. **BENCHMARK 4: Salt Update (optional)** - Update hashes in PostgreSQL with new salt (simulates salt rotation)
 
 ---
 
@@ -319,26 +324,27 @@ pool.map(worker, batches, chunksize=chunksize)
 
 ### PostgreSQL
 
-#### Table `config`
+#### Table `cf_raw` (Raw Tax Codes - UNLOGGED)
 ```sql
-CREATE TABLE config (
-    key VARCHAR(50) PRIMARY KEY,
-    value TEXT NOT NULL
+CREATE UNLOGGED TABLE cf_raw (
+    codice_fiscale VARCHAR(16) PRIMARY KEY
 );
--- Contains: ('hash_salt', 'CF_ANPR_2025_SALT_KEY')
 ```
+**Purpose**: Stores raw Italian tax codes without hashes. Source data for benchmarks 2 and 3.
 
-#### Table `codici_fiscali` (UNLOGGED)
+#### Table `codici_fiscali` (Tax Codes with Hashes - UNLOGGED)
 ```sql
 CREATE UNLOGGED TABLE codici_fiscali (
-    id SERIAL PRIMARY KEY,
-    codice_fiscale VARCHAR(16) NOT NULL,
-    hash VARCHAR(64) NOT NULL
+    hash VARCHAR(64) PRIMARY KEY,
+    codice_fiscale VARCHAR(16) NOT NULL
 );
--- Indexes (created after bulk insert):
+-- Index (created after bulk insert):
 -- - UNIQUE constraint on codice_fiscale
--- - UNIQUE INDEX on hash
 ```
+
+**Structure**:
+- `hash` (VARCHAR 64): SHA256 hash - PRIMARY KEY
+- `codice_fiscale` (VARCHAR 16): Italian tax code - UNIQUE
 
 **Hash**: Computed in Python (client-side) during insertion
 
@@ -375,11 +381,12 @@ The benchmark supports configuration via environment variables:
 
 ```bash
 # PostgreSQL table type
-USE_UNLOGGED_TABLE=false python main.py  # LOGGED (safe, slower)
-USE_UNLOGGED_TABLE=true python main.py   # UNLOGGED (fast, data loss risk) [default]
+USE_UNLOGGED_TABLE=false python main.py  # LOGGED (safe, slower) [default]
+USE_UNLOGGED_TABLE=true python main.py   # UNLOGGED (fast, data loss risk)
 
-# SHA256 hashing salt
-CF_HASH_SALT="custom_salt_2025" python main.py  # Default: CF_ANPR_2025_SALT_KEY
+# SHA256 hashing salts
+CF_HASH_SALT="custom_salt_2025" python main.py      # Default: CF_ANPR_2025_SALT_KEY
+NEW_SALT="new_salt_2026" python main.py             # For BENCHMARK 4 (salt rotation)
 
 # KeyDB connections
 KEYDB_HOST=redis.example.com python main.py   # Default: localhost
@@ -394,14 +401,18 @@ POSTGRES_USER=myuser python main.py           # Default: postgres
 POSTGRES_PASSWORD=mypass python main.py       # Default: postgres
 
 # Benchmark parameters
-TOTAL_IDS=1000000 python main.py              # Default: 6000000
-BATCH_SIZE_COMPUTATION=50000 python main.py   # Default: 100000
-BATCH_SIZE_KEYDB=5000 python main.py          # Default: 10000
-BATCH_SIZE_POSTGRES=25000 python main.py      # Default: 50000
+TOTAL_IDS=1000000 python main.py                      # Default: 6000000
+BATCH_SIZE_COMPUTATION=50000 python main.py           # Default: 100000
+BATCH_SIZE_CF_RAW=25000 python main.py                # Default: 50000
+BATCH_SIZE_KEYDB=5000 python main.py                  # Default: 10000
+BATCH_SIZE_POSTGRES=25000 python main.py              # Default: 50000
+BATCH_SIZE_POSTGRES_UPDATE=25000 python main.py       # Default: 50000
 
 # Enable/disable individual benchmarks
-RUN_KEYDB=false python main.py                # Default: true
-RUN_POSTGRES_INSERT=false python main.py      # Default: true
+RUN_POSTGRES_CF_WRITE=false python main.py      # Default: true (BENCHMARK 1bis)
+RUN_KEYDB=false python main.py                  # Default: true (BENCHMARK 2)
+RUN_POSTGRES_INSERT=false python main.py        # Default: true (BENCHMARK 3)
+RUN_POSTGRES_SALT_UPDATE=true python main.py    # Default: false (BENCHMARK 4)
 
 # Combined example: custom production configuration
 USE_UNLOGGED_TABLE=false \
@@ -413,7 +424,16 @@ python main.py
 
 # Example: Quick test with 100k records, KeyDB only
 TOTAL_IDS=100000 \
+RUN_POSTGRES_CF_WRITE=false \
 RUN_POSTGRES_INSERT=false \
+python main.py
+
+# Example: Test salt rotation (BENCHMARK 4 only)
+RUN_POSTGRES_CF_WRITE=false \
+RUN_KEYDB=false \
+RUN_POSTGRES_INSERT=false \
+RUN_POSTGRES_SALT_UPDATE=true \
+NEW_SALT="CF_ANPR_2026_NEW_SALT" \
 python main.py
 ```
 

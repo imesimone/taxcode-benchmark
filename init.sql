@@ -1,6 +1,16 @@
 -- Database initialization for Italian Tax Code (Codice Fiscale) -> SHA256 benchmark
 
--- Tax codes table (UNLOGGED for maximum performance)
+-- Raw tax codes table (UNLOGGED for maximum performance)
+-- This table stores ONLY the tax codes (no hashes) for BENCHMARK 1bis
+-- Used as source data for subsequent benchmarks
+CREATE UNLOGGED TABLE IF NOT EXISTS cf_raw (
+    codice_fiscale VARCHAR(16) PRIMARY KEY
+);
+
+COMMENT ON TABLE cf_raw IS 'Raw Italian tax codes (no hashes) - source data for benchmarks';
+COMMENT ON COLUMN cf_raw.codice_fiscale IS 'Italian tax code (16 alphanumeric characters)';
+
+-- Tax codes table with hashes (UNLOGGED for maximum performance)
 -- UNLOGGED: does not write to WAL, 2-3x faster for bulk insert
 -- WARNING: data is lost on PostgreSQL crash/restart
 -- NOTE: Indexes will be created AFTER bulk insert for maximum performance
