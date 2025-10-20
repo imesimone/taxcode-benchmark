@@ -1,0 +1,113 @@
+version: '3.8'
+
+# ============================================================================
+# PRODUCTION MODE (Data Safety & Reliability)
+# ============================================================================
+# This configuration prioritizes DATA SAFETY over performance:
+# - PostgreSQL: fsync=on, synchronous_commit=on (safe writes to disk)
+# - PostgreSQL tables: Use LOGGED tables (set USE_UNLOGGED_TABLE=false)
+# - KeyDB: Persistence ENABLED (AOF + RDB snapshots)
+# - Conservative memory/resource settings
+#
+# Usage:
+#   docker-compose -f docker-compose.production.yml up -d
+#   USE_UNLOGGED_TABLE=false python main.py
+# ============================================================================
+
+services:
+  keydb:
+    image: eqalpha/keydb:latest
+    container_name: cf_keydb_prod
+    # Note: Using network_mode: host, so ports are directly exposed on host
+    # KeyDB will be available at localhost:6379
+    # PRODUCTION configuration: persistence ENABLED for data safety
+    # Conservative resource usage (fewer threads, less memory)
+    command: >
+      keydb-server
+      --maxmemory ${KEYDB_MEMORY:-16gb}
+      --maxmemory-policy allkeys-lru
+      --server-threads ${KEYDB_THREADS:-4}
+      --save "900 1"
+      --save "300 10"
+      --save "60 10000"
+      --appendonly yes
+      --appendfsync everysec
+    # Persistence settings explained:
+    # - --save "900 1": Save to disk after 900s if at least 1 key changed
+    # - --save "300 10": Save to disk after 300s if at least 10 keys changed
+    # - --save "60 10000": Save to disk after 60s if at least 10k keys changed
+    # - --appendonly yes: Enable AOF (Append-Only File) for durability
+    # - --appendfsync everysec: Sync AOF to disk every second (good balance)
+    # Result: Data is safe on crash/restart, but writes are ~2-3x slower
+    volumes:
+      - keydb_data:/data
+    restart: unless-stopped
+    network_mode: host
+    # Healthcheck enabled for production monitoring
+    healthcheck:
+      test: ["CMD", "keydb-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cf_postgres_prod
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cf_benchmark
+      # PostgreSQL PRODUCTION memory parameters (conservative, safe)
+      # Values are smaller than benchmark mode to ensure stability
+      POSTGRES_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-4GB}
+      POSTGRES_WORK_MEM: ${PG_WORK_MEM:-128MB}
+      POSTGRES_MAINTENANCE_WORK_MEM: ${PG_MAINTENANCE_WORK_MEM:-1GB}
+      POSTGRES_EFFECTIVE_CACHE_SIZE: ${PG_EFFECTIVE_CACHE_SIZE:-8GB}
+      POSTGRES_MAX_WAL_SIZE: ${PG_MAX_WAL_SIZE:-2GB}
+    # PRODUCTION MODE: Safe settings for data durability
+    # ✅ All safety features ENABLED
+    command: >
+      postgres
+      -c shared_buffers=${PG_SHARED_BUFFERS:-4GB}
+      -c work_mem=${PG_WORK_MEM:-128MB}
+      -c maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-1GB}
+      -c effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-8GB}
+      -c max_wal_size=${PG_MAX_WAL_SIZE:-2GB}
+      -c fsync=on
+      -c synchronous_commit=on
+      -c full_page_writes=on
+      -c checkpoint_timeout=5min
+      -c max_connections=100
+      -c effective_io_concurrency=200
+      -c wal_buffers=16MB
+      -c random_page_cost=1.1
+      -c log_min_duration_statement=1000
+    # Safety settings explained:
+    # - fsync=on: Waits for disk write confirmation (SAFE, slower)
+    #   Result: Data is guaranteed to be on disk, but writes are slower
+    # - synchronous_commit=on: Waits for WAL flush to disk before commit
+    #   Result: No transactions lost on crash, but commits are slower
+    # - full_page_writes=on: Writes full pages to WAL after checkpoint
+    #   Result: Protection against partial page writes, slightly larger WAL
+    # - checkpoint_timeout=5min: More frequent checkpoints for faster recovery
+    # - log_min_duration_statement=1000: Log queries slower than 1 second
+    #
+    # IMPORTANT: Remember to also set USE_UNLOGGED_TABLE=false when running:
+    #   USE_UNLOGGED_TABLE=false python main.py
+    # Note: Using network_mode: host, so ports are directly exposed on host
+    # PostgreSQL will be available at localhost:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    network_mode: host
+    # Healthcheck enabled for production monitoring
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  keydb_data:
+  postgres_data:
