@@ -76,7 +76,7 @@ USE_UNLOGGED_TABLE=false python main.py
 3. **Read from PostgreSQL** - Read tax codes from `cf_raw` table for subsequent benchmarks
 4. **BENCHMARK 2: Hash Computation + KeyDB Write** - Read tax codes, compute SHA256 hashes, write to KeyDB
 5. **BENCHMARK 3: Hash Computation + PostgreSQL Write** - Read tax codes, compute SHA256 hashes, write to PostgreSQL `codici_fiscali` table
-6. **BENCHMARK 4: Salt Update (optional)** - Update hashes in PostgreSQL with new salt (simulates salt rotation)
+6. **BENCHMARK 4: Salt Rotation (optional)** - Recalculate and replace all hashes with new salt using TRUNCATE + COPY strategy (10-20x faster than UPDATE)
 
 ---
 
@@ -292,7 +292,70 @@ for tax_code in tax_code_list:
 - Distributes CPU load (PostgreSQL doesn't compute hashes)
 - Reduces database CPU usage during bulk insert operations
 
-### 5. Multiprocessing
+### 5. PostgreSQL - Salt Rotation (BENCHMARK 4)
+
+#### Problem
+When you need to update the hashing salt for security reasons, you must recalculate all 6M+ hashes and update the database. Traditional UPDATE operations are extremely slow because:
+- PostgreSQL must reorganize the PRIMARY KEY index (hash column) for every update
+- Each UPDATE creates dead tuples (MVCC overhead)
+- UPDATE with JOIN on millions of rows has significant overhead
+
+**Naive UPDATE approach**: ~15,000 updates/sec (404 seconds for 6M records)
+
+#### Implemented Solution
+
+**TRUNCATE + COPY Strategy** (10-20x faster than UPDATE):
+
+```python
+# ❌ SLOW: UPDATE with JOIN (15k updates/sec)
+UPDATE codici_fiscali
+SET hash = new_hash
+FROM temp_table
+WHERE codici_fiscali.codice_fiscale = temp_table.codice_fiscale
+
+# ✅ FAST: TRUNCATE + COPY (150k-200k inserts/sec)
+# Step 1: Read existing tax codes from database
+tax_codes = read_from_db()
+
+# Step 2: Recalculate all hashes with NEW_SALT (parallel)
+new_hashes = parallel_hash_computation(tax_codes, NEW_SALT)
+
+# Step 3: Drop constraint
+ALTER TABLE codici_fiscali DROP CONSTRAINT codici_fiscali_codice_fiscale_key
+
+# Step 4: TRUNCATE table (instantaneous)
+TRUNCATE TABLE codici_fiscali
+
+# Step 5: Repopulate with COPY FROM STDIN (parallel, same as BENCHMARK 3)
+COPY codici_fiscali (hash, codice_fiscale) FROM STDIN
+
+# Step 6: Recreate constraint
+ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)
+```
+
+**Why This Works**:
+1. **TRUNCATE is instantaneous** - just marks all pages as free (no row-by-row deletion)
+2. **COPY is 10-20x faster** than UPDATE - optimized bulk loading path in PostgreSQL
+3. **No MVCC overhead** - no dead tuples, no bloat
+4. **No index reorganization during insert** - constraint is dropped, recreated at the end
+5. **Parallel processing** - same multiprocessing strategy as BENCHMARK 3
+
+**Trade-offs**:
+- ✅ **Much faster**: 404s → ~30-40s (10x improvement)
+- ✅ **No table bloat**: fresh data, no dead tuples
+- ⚠️ **Requires downtime**: table is empty during repopulation
+- ⚠️ **All-or-nothing**: can't update a subset of records
+
+**Use Case**: Perfect for scheduled maintenance windows when you need to rotate salt keys for security compliance.
+
+**Performance Comparison**:
+```
+UPDATE approach:  404.42s (14,836 updates/sec)
+TRUNCATE + COPY:  ~30-40s (150,000-200,000 inserts/sec)
+Speedup:          ~10-13x faster
+```
+
+### 6. Multiprocessing
 
 #### Problem
 Python GIL (Global Interpreter Lock) limits parallelism on CPU-intensive operations in threads.
@@ -412,7 +475,7 @@ BATCH_SIZE_POSTGRES_UPDATE=25000 python main.py       # Default: 50000
 RUN_POSTGRES_CF_WRITE=false python main.py      # Default: true (BENCHMARK 1bis)
 RUN_KEYDB=false python main.py                  # Default: true (BENCHMARK 2)
 RUN_POSTGRES_INSERT=false python main.py        # Default: true (BENCHMARK 3)
-RUN_POSTGRES_SALT_UPDATE=true python main.py    # Default: false (BENCHMARK 4)
+RUN_POSTGRES_SALT_UPDATE=false python main.py   # Default: true (BENCHMARK 4 - salt rotation)
 
 # Combined example: custom production configuration
 USE_UNLOGGED_TABLE=false \
@@ -429,11 +492,17 @@ RUN_POSTGRES_INSERT=false \
 python main.py
 
 # Example: Test salt rotation (BENCHMARK 4 only)
+# Note: Requires existing data in codici_fiscali table (run BENCHMARK 3 first)
+# Uses TRUNCATE + COPY strategy (10x faster than UPDATE)
 RUN_POSTGRES_CF_WRITE=false \
 RUN_KEYDB=false \
 RUN_POSTGRES_INSERT=false \
 RUN_POSTGRES_SALT_UPDATE=true \
 NEW_SALT="CF_ANPR_2026_NEW_SALT" \
+python main.py
+
+# Example: Full pipeline including salt rotation
+# Runs all benchmarks in sequence: generate → write → KeyDB → PostgreSQL → salt rotation
 python main.py
 ```
 

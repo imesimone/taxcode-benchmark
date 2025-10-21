@@ -13,7 +13,6 @@ import os
 import random
 import string
 import time
-from multiprocessing import Pool
 from typing import List, Tuple, Optional
 
 import psycopg2
@@ -167,7 +166,7 @@ def generate_tax_codes_with_hashes(total_ids: int, batch_size: int = 100_000, nu
 		batch_sizes.append(remainder)
 
 	# Generate tax codes with hashes in parallel
-	with Pool(processes=num_processes) as pool:
+	with mp.Pool(processes=num_processes) as pool:
 		results = pool.map(generate_tax_code_with_hash_batch_worker, batch_sizes, chunksize=max(1, len(batch_sizes) // (num_processes * 4)))
 
 	# Merge all results
@@ -229,7 +228,7 @@ def generate_tax_codes_only(total_ids: int, batch_size: int = 100_000, num_proce
 		batch_sizes.append(remainder)
 
 	# Generate tax codes in parallel
-	with Pool(processes=num_processes) as pool:
+	with mp.Pool(processes=num_processes) as pool:
 		results = pool.map(generate_cf_batch_worker, batch_sizes, chunksize=max(1, len(batch_sizes) // (num_processes * 4)))
 
 	# Merge all results
@@ -392,7 +391,7 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 		batch_data.append((batch_tax_codes, i // batch_size))
 
 	chunksize = max(1, len(batch_data) // (num_processes * 8))
-	with Pool(processes=num_processes) as pool:
+	with mp.Pool(processes=num_processes) as pool:
 		results = pool.map(write_cf_raw_batch_worker, batch_data, chunksize=chunksize)
 
 	insert_time = time.time() - start_time
@@ -424,14 +423,20 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 	return total_time
 
 
-def read_tax_codes_from_cf_raw() -> List[str]:
+def read_tax_codes_from_cf_raw(batch_size: int = 500_000) -> List[str]:
 	"""
-	Read all tax codes from PostgreSQL cf_raw table.
+	Read tax codes from PostgreSQL cf_raw table using server-side cursor (batch processing).
+
+	This function uses a named cursor to fetch data in batches, avoiding loading
+	all 65M+ records into memory at once.
+
+	Args:
+		batch_size: Number of records to fetch per batch (default: 500k)
 
 	Returns:
 		List[str]: List of all tax codes
 	"""
-	print("📥 Reading tax codes from PostgreSQL cf_raw table...")
+	print("📥 Reading tax codes from PostgreSQL cf_raw table (batch processing)...")
 
 	conn = psycopg2.connect(
 		host=POSTGRES_HOST,
@@ -440,14 +445,31 @@ def read_tax_codes_from_cf_raw() -> List[str]:
 		user=POSTGRES_USER,
 		password=POSTGRES_PASSWORD
 	)
-	cur = conn.cursor()
+
+	# Use named cursor for server-side cursor (memory efficient)
+	cur = conn.cursor(name='fetch_cf_raw')
+	cur.itersize = batch_size  # Fetch batch_size rows at a time
 
 	try:
 		start_time = time.time()
 
-		# Read all tax codes
+		# Read tax codes in batches using server-side cursor
 		cur.execute("SELECT codice_fiscale FROM cf_raw ORDER BY codice_fiscale")
-		tax_codes = [row[0] for row in cur.fetchall()]
+
+		tax_codes = []
+		batch_count = 0
+
+		while True:
+			rows = cur.fetchmany(batch_size)
+			if not rows:
+				break
+
+			batch_count += 1
+			tax_codes.extend([row[0] for row in rows])
+
+			# Progress update every batch
+			if batch_count % 10 == 0:
+				print(f"   Progress: {len(tax_codes):,} records read...")
 
 		elapsed = time.time() - start_time
 
@@ -550,7 +572,7 @@ def benchmark_keydb(batch_size: int = 10_000, num_processes: int = None, tax_cod
 		batch_data.append((batch_tax_codes, i // batch_size))
 
 	chunksize = max(1, len(batch_data) // (num_processes * 4))
-	with Pool(processes=num_processes) as pool:
+	with mp.Pool(processes=num_processes) as pool:
 		results = pool.map(write_keydb_batch_worker, batch_data, chunksize=chunksize)
 
 	insert_time = time.time() - start_time
@@ -725,7 +747,7 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 		batch_data.append((batch_tax_codes, i // batch_size))
 
 	chunksize = max(1, len(batch_data) // (num_processes * 8))
-	with Pool(processes=num_processes) as pool:
+	with mp.Pool(processes=num_processes) as pool:
 		results = pool.map(write_postgres_batch_worker, batch_data, chunksize=chunksize)
 
 	insert_time = time.time() - start_time
@@ -777,7 +799,7 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 	return total_time
 
 
-def benchmark_postgres_salt_update(batch_size: int = 50_000) -> Optional[float]:
+def benchmark_postgres_salt_update(batch_size: int = 50_000, num_processes: int = None) -> Optional[float]:
 	"""
 	BENCHMARK 4: Update PostgreSQL hashes with new salt (salt rotation scenario).
 
@@ -786,6 +808,7 @@ def benchmark_postgres_salt_update(batch_size: int = 50_000) -> Optional[float]:
 
 	Args:
 		batch_size: Size of each batch for UPDATE operations
+		num_processes: Number of parallel processes for hash computation
 
 	Returns:
 		float: Total elapsed time in seconds, or None on error
@@ -797,10 +820,262 @@ def benchmark_postgres_salt_update(batch_size: int = 50_000) -> Optional[float]:
 	print(f"   New salt: {NEW_SALT}")
 	print(f"   Batch size: {batch_size:,}")
 	print("")
-	print("⚠️  BENCHMARK 4 not yet implemented in this version")
-	print("   (Requires reading from codici_fiscali and updating hashes)")
+
+	# Determine number of processes
+	if num_processes is None:
+		num_processes = max(1, mp.cpu_count() - 1)
+
+	start_time = time.time()
+
+	# PHASE 1: Read existing tax codes from codici_fiscali
+	print("📖 PHASE 1: Reading tax codes from codici_fiscali...")
+	try:
+		conn = psycopg2.connect(
+			host=POSTGRES_HOST,
+			port=POSTGRES_PORT,
+			user=POSTGRES_USER,
+			password=POSTGRES_PASSWORD,
+			database=POSTGRES_DB
+		)
+
+		# Use named cursor for server-side cursor (memory efficient for 65M+ records)
+		cur = conn.cursor(name='fetch_codici_fiscali')
+		cur.itersize = batch_size  # Fetch batch_size rows at a time
+
+		# Select codice_fiscale and old hash
+		cur.execute("SELECT codice_fiscale, hash FROM codici_fiscali")
+
+		tax_codes = []
+		old_hashes = []
+		batch_count = 0
+
+		print("   Reading data in batches using server-side cursor...")
+		while True:
+			rows = cur.fetchmany(batch_size)
+			if not rows:
+				break
+
+			batch_count += 1
+			for row in rows:
+				tax_codes.append(row[0])
+				old_hashes.append(row[1])
+
+			# Progress update every 10 batches
+			if batch_count % 10 == 0:
+				print(f"   Progress: {len(tax_codes):,} records read...")
+
+		cur.close()
+		conn.close()
+
+		read_time = time.time() - start_time
+		print(f"   ✓ Read {len(tax_codes):,} tax codes in {read_time:.2f}s")
+
+		if len(tax_codes) == 0:
+			print("   ⚠️  No tax codes found in codici_fiscali table")
+			print("   Skipping BENCHMARK 4")
+			return None
+
+	except Exception as e:
+		print(f"   ✗ Error reading tax codes: {e}")
+		return None
+
 	print("")
-	return 0.0
+
+	# PHASE 2: Recalculate hashes with NEW_SALT in parallel
+	print(f"🔢 PHASE 2: Recalculating hashes with NEW_SALT ({num_processes} processes)...")
+	hash_start_time = time.time()
+
+	# Split tax codes into chunks for parallel processing
+	chunk_size = max(1, len(tax_codes) // num_processes)
+	chunks = [tax_codes[i:i + chunk_size] for i in range(0, len(tax_codes), chunk_size)]
+
+	# Compute new hashes in parallel
+	with mp.Pool(processes=num_processes) as pool:
+		# Use the existing compute_hash_batch_worker with NEW_SALT_BYTES
+		# We need to create a wrapper that uses NEW_SALT_BYTES instead of SALT_BYTES
+		results = pool.map(compute_hash_batch_with_new_salt, chunks)
+
+	# Flatten results
+	new_hashes = []
+	for result in results:
+		new_hashes.extend(result)
+
+	hash_time = time.time() - hash_start_time
+	print(f"   ✓ Recalculated {len(new_hashes):,} hashes in {hash_time:.2f}s")
+	print(f"   Performance: {len(new_hashes) / hash_time:,.0f} hashes/sec")
+	print("")
+
+	# PHASE 3: Repopulate PostgreSQL with new hashes (TRUNCATE + COPY strategy)
+	print("💾 PHASE 3: Repopulating PostgreSQL with new hashes...")
+	print("   Strategy: TRUNCATE table + COPY FROM STDIN (10-20x faster than UPDATE)")
+	update_start_time = time.time()
+
+	try:
+		# Connect as admin user for table management
+		conn_admin = psycopg2.connect(
+			host=POSTGRES_HOST,
+			port=POSTGRES_PORT,
+			user=POSTGRES_USER,
+			password=POSTGRES_PASSWORD,
+			database=POSTGRES_DB
+		)
+		conn_admin.autocommit = False
+		cur_admin = conn_admin.cursor()
+
+		# Drop UNIQUE constraint before TRUNCATE for maximum performance
+		print("   - Dropping UNIQUE constraint on codice_fiscale...")
+		try:
+			cur_admin.execute("ALTER TABLE codici_fiscali DROP CONSTRAINT IF EXISTS codici_fiscali_codice_fiscale_key")
+			conn_admin.commit()
+			print("   ✓ Constraint dropped")
+		except Exception as e:
+			print(f"   ⚠️  Could not drop constraint (may not exist): {e}")
+			conn_admin.rollback()
+
+		# TRUNCATE table (instantaneous - removes all data)
+		print("   - Truncating codici_fiscali table...")
+		cur_admin.execute("TRUNCATE TABLE codici_fiscali")
+		conn_admin.commit()
+		print("   ✓ Table truncated")
+
+		# Prepare data for insertion: (new_hash, codice_fiscale)
+		data_to_insert = list(zip(new_hashes, tax_codes))
+
+		# Parallel COPY FROM STDIN insertion (same strategy as BENCHMARK 3)
+		print(f"   - Inserting with new hashes using COPY FROM STDIN (batch size: {batch_size:,})...")
+
+		# Split data into batches for parallel processing
+		batch_data = []
+		for i in range(0, len(data_to_insert), batch_size):
+			batch = data_to_insert[i:i+batch_size]
+			batch_data.append((batch, i // batch_size))
+
+		# Use multiprocessing for parallel COPY operations
+		num_processes = min(mp.cpu_count(), 8)  # Max 8 parallel DB connections
+		chunksize = max(1, len(batch_data) // (num_processes * 8))
+
+		with mp.Pool(processes=num_processes) as pool:
+			results = pool.map(write_salt_update_batch_worker, batch_data, chunksize=chunksize)
+
+		insert_time = time.time() - update_start_time
+		total_inserted = sum(results)
+
+		print(f"   ✓ Inserted {total_inserted:,} records with new hashes in {insert_time:.2f}s")
+		print(f"   Performance: {total_inserted / insert_time:,.0f} inserts/sec")
+		print("")
+
+		# PHASE 4: Recreate UNIQUE constraint
+		print("   - Recreating UNIQUE constraint on codice_fiscale...")
+		constraint_start_time = time.time()
+		constraint_time = 0
+		try:
+			cur_admin.execute("ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)")
+			conn_admin.commit()
+			constraint_time = time.time() - constraint_start_time
+			print(f"   ✓ Constraint created in {constraint_time:.2f}s")
+		except Exception as e:
+			print(f"   ✗ Constraint creation error: {e}")
+			conn_admin.rollback()
+			constraint_time = 0
+
+		print("")
+
+		# PHASE 5: ANALYZE to update statistics
+		print("   - Executing ANALYZE...")
+		analyze_start_time = time.time()
+		cur_admin.execute("ANALYZE codici_fiscali")
+		conn_admin.commit()
+		analyze_time = time.time() - analyze_start_time
+		print(f"   ✓ ANALYZE completed in {analyze_time:.2f}s")
+
+		cur_admin.close()
+		conn_admin.close()
+
+	except Exception as e:
+		print(f"   ✗ Error repopulating table: {e}")
+		return None
+
+	total_time = time.time() - start_time
+
+	print("")
+	print("📊 SUMMARY:")
+	print(f"   - Read tax codes: {read_time:.2f}s")
+	print(f"   - Hash recalculation: {hash_time:.2f}s ({len(new_hashes) / hash_time:,.0f} hashes/sec)")
+	print(f"   - Database repopulation: {insert_time:.2f}s ({total_inserted / insert_time:,.0f} inserts/sec)")
+	print(f"   - Constraint creation: {constraint_time:.2f}s")
+	print(f"   - ANALYZE: {analyze_time:.2f}s")
+	print(f"   - TOTAL: {total_time:.2f}s")
+	print("")
+
+	return total_time
+
+
+def compute_hash_batch_with_new_salt(tax_codes: List[str]) -> List[str]:
+	"""
+	Worker function for computing hashes with NEW_SALT (for BENCHMARK 4).
+
+	Args:
+		tax_codes: List of tax codes to hash
+
+	Returns:
+		List of SHA256 hashes computed with NEW_SALT
+	"""
+	return [hashlib.sha256(cf.encode('utf-8') + NEW_SALT_BYTES).hexdigest() for cf in tax_codes]
+
+
+def write_salt_update_batch_worker(args):
+	"""
+	Worker function for writing (new_hash, codice_fiscale) pairs to PostgreSQL (BENCHMARK 4).
+
+	Uses COPY FROM STDIN for maximum performance during salt rotation.
+
+	Args:
+		args: Tuple of (data_batch, worker_id)
+		      data_batch: List of (hash, codice_fiscale) tuples
+
+	Returns:
+		int: Number of records written
+	"""
+	data_batch, worker_id = args
+
+	# Optimize connection parameters for maximum performance
+	conn = psycopg2.connect(
+		host=POSTGRES_HOST,
+		port=POSTGRES_PORT,
+		database=POSTGRES_DB,
+		user=POSTGRES_USER,
+		password=POSTGRES_PASSWORD,
+		# Disable synchronous_commit for maximum performance
+		options='-c synchronous_commit=off'
+	)
+	cur = conn.cursor()
+
+	try:
+		# Create CSV buffer in memory
+		buffer = io.StringIO()
+
+		# Write data as (hash, codice_fiscale) - hash is PRIMARY KEY
+		for hash_val, tax_code in data_batch:
+			buffer.write(f"{hash_val},{tax_code}\n")
+
+		buffer.seek(0)
+
+		# COPY FROM STDIN is 10-20x faster than INSERT/UPDATE
+		try:
+			cur.copy_expert(
+				"COPY codici_fiscali (hash, codice_fiscale) FROM STDIN WITH (FORMAT CSV)",
+				buffer
+			)
+		except psycopg2.errors.UniqueViolation:
+			# Ignore duplicates (should not occur with unique hashes)
+			conn.rollback()
+		else:
+			conn.commit()
+
+		return len(data_batch)
+	finally:
+		cur.close()
+		conn.close()
 
 
 def main():
@@ -817,7 +1092,7 @@ def main():
 	RUN_POSTGRES_CF_WRITE = os.getenv('RUN_POSTGRES_CF_WRITE', 'true').lower() == 'true'
 	RUN_KEYDB = os.getenv('RUN_KEYDB', 'true').lower() == 'true'
 	RUN_POSTGRES_INSERT = os.getenv('RUN_POSTGRES_INSERT', 'true').lower() == 'true'
-	RUN_POSTGRES_SALT_UPDATE = os.getenv('RUN_POSTGRES_SALT_UPDATE', 'false').lower() == 'true'
+	RUN_POSTGRES_SALT_UPDATE = os.getenv('RUN_POSTGRES_SALT_UPDATE', 'true').lower() == 'true'
 
 	print("\n" + "=" * 60)
 	print("🚀 BENCHMARK: TAX CODE -> SHA256 HASH")
@@ -834,7 +1109,8 @@ def main():
 		time_cf_raw_write = benchmark_postgres_cf_raw_write(BATCH_SIZE_CF_RAW, tax_codes=all_tax_codes)
 
 	# Read tax codes from PostgreSQL cf_raw for subsequent benchmarks
-	if RUN_KEYDB or RUN_POSTGRES_INSERT:
+	# Only read from database if we wrote to cf_raw; otherwise use in-memory tax codes
+	if RUN_POSTGRES_CF_WRITE and (RUN_KEYDB or RUN_POSTGRES_INSERT):
 		tax_codes_from_db = read_tax_codes_from_cf_raw()
 	else:
 		tax_codes_from_db = all_tax_codes
