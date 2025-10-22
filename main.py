@@ -52,10 +52,7 @@ POSTGRES_DB = os.getenv('POSTGRES_DB', 'cf_benchmark')
 POSTGRES_USER = os.getenv('POSTGRES_USER', 'postgres')
 POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'postgres')
 
-# PostgreSQL optimization parameters (configurable via environment variables)
-# USE_UNLOGGED_TABLE: when True, uses UNLOGGED TABLE (2-3x faster, DATA LOSS on crash)
-# Default: false (safe LOGGED tables for production)
-USE_UNLOGGED_TABLE = os.getenv('USE_UNLOGGED_TABLE', 'false').lower() == 'true'
+# PostgreSQL optimization: Always use LOGGED tables (safe for production)
 
 # Global Redis connection pool (reuses connections across workers)
 _redis_pool = None
@@ -317,7 +314,6 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 	print(f"   Records to insert: {len(tax_codes):,}")
 	print(f"   Parallel processes: {num_processes}")
 	print(f"   Batch size: {batch_size:,}")
-	print(f"   Table type: {'UNLOGGED' if USE_UNLOGGED_TABLE else 'LOGGED'}")
 
 	# Connection for schema management
 	try:
@@ -336,7 +332,7 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 	print("")
 	print("📋 PRE-INSERT PHASE: Table preparation...")
 
-	# PHASE 0: Verify/convert table type (LOGGED/UNLOGGED)
+	# PHASE 0: Ensure table is LOGGED (production requirement)
 	try:
 		cur_admin.execute("""
 			SELECT relpersistence FROM pg_class
@@ -348,19 +344,13 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 			current_persistence = result[0]
 			is_currently_unlogged = (current_persistence == 'u')
 
-			if USE_UNLOGGED_TABLE and not is_currently_unlogged:
-				print("   - Converting table from LOGGED to UNLOGGED...")
-				cur_admin.execute("ALTER TABLE cf_raw SET UNLOGGED")
-				conn_admin.commit()
-				print("   ✓ Table converted to UNLOGGED")
-			elif not USE_UNLOGGED_TABLE and is_currently_unlogged:
-				print("   - Converting table from UNLOGGED to LOGGED...")
+			if is_currently_unlogged:
+				print("   - Converting table from UNLOGGED to LOGGED (production requirement)...")
 				cur_admin.execute("ALTER TABLE cf_raw SET LOGGED")
 				conn_admin.commit()
 				print("   ✓ Table converted to LOGGED")
 			else:
-				table_type = "UNLOGGED" if is_currently_unlogged else "LOGGED"
-				print(f"   ✓ Table is already {table_type} (no conversion needed)")
+				print(f"   ✓ Table is already LOGGED (production ready)")
 	except Exception as e:
 		print(f"   ⚠️  Table type verification warning: {e}")
 		conn_admin.rollback()
@@ -423,20 +413,49 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 	return total_time
 
 
-def read_tax_codes_from_cf_raw(batch_size: int = 500_000) -> List[str]:
+def get_tax_codes_in_batches(source, mega_batch_size: int = 2_000_000):
 	"""
-	Read tax codes from PostgreSQL cf_raw table using server-side cursor (batch processing).
-
-	This function uses a named cursor to fetch data in batches, avoiding loading
-	all 65M+ records into memory at once.
+	Universal generator that yields mega-batches of tax codes from either DB or memory.
 
 	Args:
-		batch_size: Number of records to fetch per batch (default: 500k)
+		source: Either 'db' to read from PostgreSQL cf_raw, or a list of tax codes
+		mega_batch_size: Number of records to yield per mega-batch (default: 2M)
 
-	Returns:
-		List[str]: List of all tax codes
+	Yields:
+		List[str]: Mega-batch of tax codes (up to mega_batch_size records)
 	"""
-	print("📥 Reading tax codes from PostgreSQL cf_raw table (batch processing)...")
+	if source == 'db':
+		# Read from PostgreSQL cf_raw table
+		yield from read_tax_codes_from_cf_raw_in_batches(mega_batch_size=mega_batch_size)
+	else:
+		# Chunk in-memory list into mega-batches
+		tax_codes_list = source
+		total_records = len(tax_codes_list)
+
+		for i in range(0, total_records, mega_batch_size):
+			mega_batch = tax_codes_list[i:i + mega_batch_size]
+			batch_num = (i // mega_batch_size) + 1
+			total_batches = (total_records + mega_batch_size - 1) // mega_batch_size
+
+			print(f"   📦 Mega-batch {batch_num}/{total_batches}: {len(mega_batch):,} records")
+			yield mega_batch
+
+
+def read_tax_codes_from_cf_raw_in_batches(mega_batch_size: int = 2_000_000, fetch_batch_size: int = 500_000):
+	"""
+	Generator that yields mega-batches of tax codes from PostgreSQL cf_raw table.
+
+	This function uses a server-side cursor to fetch data in chunks, yielding
+	mega-batches to avoid loading all 65M+ records into memory at once.
+
+	Args:
+		mega_batch_size: Number of records to yield per mega-batch (default: 2M)
+		fetch_batch_size: Number of records to fetch from DB at a time (default: 500k)
+
+	Yields:
+		List[str]: Mega-batch of tax codes (up to mega_batch_size records)
+	"""
+	print(f"📥 Reading tax codes from PostgreSQL cf_raw table in mega-batches ({mega_batch_size:,} per batch)...")
 
 	conn = psycopg2.connect(
 		host=POSTGRES_HOST,
@@ -448,7 +467,7 @@ def read_tax_codes_from_cf_raw(batch_size: int = 500_000) -> List[str]:
 
 	# Use named cursor for server-side cursor (memory efficient)
 	cur = conn.cursor(name='fetch_cf_raw')
-	cur.itersize = batch_size  # Fetch batch_size rows at a time
+	cur.itersize = fetch_batch_size  # Fetch fetch_batch_size rows at a time
 
 	try:
 		start_time = time.time()
@@ -456,28 +475,40 @@ def read_tax_codes_from_cf_raw(batch_size: int = 500_000) -> List[str]:
 		# Read tax codes in batches using server-side cursor
 		cur.execute("SELECT codice_fiscale FROM cf_raw ORDER BY codice_fiscale")
 
-		tax_codes = []
-		batch_count = 0
+		mega_batch_buffer = []
+		total_read = 0
+		mega_batch_count = 0
 
 		while True:
-			rows = cur.fetchmany(batch_size)
+			rows = cur.fetchmany(fetch_batch_size)
 			if not rows:
 				break
 
-			batch_count += 1
-			tax_codes.extend([row[0] for row in rows])
+			# Add fetched rows to buffer
+			mega_batch_buffer.extend([row[0] for row in rows])
+			total_read += len(rows)
 
-			# Progress update every batch
-			if batch_count % 10 == 0:
-				print(f"   Progress: {len(tax_codes):,} records read...")
+			# When buffer reaches mega_batch_size, yield it
+			while len(mega_batch_buffer) >= mega_batch_size:
+				mega_batch_count += 1
+				yield_batch = mega_batch_buffer[:mega_batch_size]
+				mega_batch_buffer = mega_batch_buffer[mega_batch_size:]
+
+				print(f"   📦 Mega-batch {mega_batch_count}: {len(yield_batch):,} records (total read: {total_read:,})")
+				yield yield_batch
+
+		# Yield remaining records
+		if mega_batch_buffer:
+			mega_batch_count += 1
+			print(f"   📦 Mega-batch {mega_batch_count} (final): {len(mega_batch_buffer):,} records (total read: {total_read:,})")
+			yield mega_batch_buffer
 
 		elapsed = time.time() - start_time
 
-		print(f"✅ Read {len(tax_codes):,} tax codes in {elapsed:.2f}s")
-		print(f"   Throughput: {len(tax_codes) / elapsed:,.0f} records/sec")
+		print(f"✅ Read complete: {total_read:,} tax codes in {elapsed:.2f}s ({mega_batch_count} mega-batches)")
+		print(f"   Throughput: {total_read / elapsed:,.0f} records/sec")
 		print("")
 
-		return tax_codes
 	finally:
 		cur.close()
 		conn.close()
@@ -515,7 +546,7 @@ def write_keydb_batch_worker(args):
 	return len(tax_codes)
 
 
-def benchmark_keydb(batch_size: int = 10_000, num_processes: int = None, tax_codes: List[str] = None) -> Optional[float]:
+def benchmark_keydb(batch_size: int = 10_000, num_processes: int = None, tax_codes: List[str] = None, incremental_mode: bool = False) -> Optional[float]:
 	"""
 	BENCHMARK 2: KeyDB write operations - computes hashes and writes to KeyDB.
 
@@ -525,6 +556,7 @@ def benchmark_keydb(batch_size: int = 10_000, num_processes: int = None, tax_cod
 		batch_size: Size of each batch for write operations
 		num_processes: Number of parallel processes (defaults to CPU count)
 		tax_codes: List of tax codes (hashes will be computed)
+		incremental_mode: If True, skips header/footer (for mega-batch processing)
 
 	Returns:
 		float: Total elapsed time in seconds, or None on error
@@ -533,36 +565,47 @@ def benchmark_keydb(batch_size: int = 10_000, num_processes: int = None, tax_cod
 		num_processes = mp.cpu_count()
 
 	if not tax_codes:
-		print("❌ No tax codes provided for KeyDB benchmark")
+		if not incremental_mode:
+			print("❌ No tax codes provided for KeyDB benchmark")
 		return None
 
-	print("\n" + "=" * 60)
-	print("📮 BENCHMARK 2: HASH COMPUTATION + KEYDB WRITE")
-	print("=" * 60)
-	print(f"   Tax codes to process: {len(tax_codes):,}")
-	print(f"   Parallel processes: {num_processes}")
-	print(f"   Batch size: {batch_size:,}")
+	if not incremental_mode:
+		print("\n" + "=" * 60)
+		print("📮 BENCHMARK 2: HASH COMPUTATION + KEYDB WRITE")
+		print("=" * 60)
+		print(f"   Tax codes to process: {len(tax_codes):,}")
+		print(f"   Parallel processes: {num_processes}")
+		print(f"   Batch size: {batch_size:,}")
 
-	try:
-		r = redis.Redis(host=KEYDB_HOST, port=KEYDB_PORT, db=KEYDB_DB, decode_responses=False)
+		try:
+			r = redis.Redis(host=KEYDB_HOST, port=KEYDB_PORT, db=KEYDB_DB, decode_responses=False)
 
-		# Wait for KeyDB to be ready
-		max_retries = 30
-		for i in range(max_retries):
-			try:
-				r.ping()
-				break
-			except redis.exceptions.BusyLoadingError:
-				if i == max_retries - 1:
-					raise
-				time.sleep(1)
+			# Wait for KeyDB to be ready
+			max_retries = 30
+			for i in range(max_retries):
+				try:
+					r.ping()
+					break
+				except redis.exceptions.BusyLoadingError:
+					if i == max_retries - 1:
+						raise
+					time.sleep(1)
 
-	except Exception as e:
-		print(f"❌ KeyDB connection error: {e}")
-		return None
+		except Exception as e:
+			print(f"❌ KeyDB connection error: {e}")
+			return None
 
-	print("")
-	print("📥 HASH + INSERT PHASE: Computing hashes and writing to KeyDB...")
+		print("")
+		print("📥 HASH + INSERT PHASE: Computing hashes and writing to KeyDB...")
+	else:
+		# In incremental mode, just verify connection
+		try:
+			r = redis.Redis(host=KEYDB_HOST, port=KEYDB_PORT, db=KEYDB_DB, decode_responses=False)
+			r.ping()
+		except Exception as e:
+			print(f"❌ KeyDB connection error: {e}")
+			return None
+
 	start_time = time.time()
 
 	# Split data into batches
@@ -578,8 +621,11 @@ def benchmark_keydb(batch_size: int = 10_000, num_processes: int = None, tax_cod
 	insert_time = time.time() - start_time
 	total_count = sum(results)
 
-	print(f"✅ Completed: {total_count:,} records in {insert_time:.2f}s")
-	print(f"   Throughput: {total_count / insert_time:,.0f} records/sec")
+	if not incremental_mode:
+		print(f"✅ Completed: {total_count:,} records in {insert_time:.2f}s")
+		print(f"   Throughput: {total_count / insert_time:,.0f} records/sec")
+	else:
+		print(f"   ✓ Processed {total_count:,} records in {insert_time:.2f}s ({total_count / insert_time:,.0f} rec/s)")
 
 	return insert_time
 
@@ -642,37 +688,13 @@ def write_postgres_batch_worker(args):
 		conn.close()
 
 
-def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = None, tax_codes: List[str] = None) -> Optional[float]:
+def postgres_insert_init():
 	"""
-	BENCHMARK 3: PostgreSQL write operations - computes hashes and writes to PostgreSQL.
-
-	Optimized with COPY FROM STDIN + index management + hash computation.
-	Follows best practices: drops indexes BEFORE bulk insert, recreates AFTER, executes ANALYZE.
-
-	Args:
-		batch_size: Size of each batch for write operations
-		num_processes: Number of parallel processes (defaults to min(CPU count, 8))
-		tax_codes: List of tax codes (hashes will be computed)
+	Initialize PostgreSQL for bulk insert: check table type, drop indexes, set parameters.
 
 	Returns:
-		float: Total elapsed time in seconds, or None on error
+		Tuple[cursor, connection]: Admin cursor and connection to use for subsequent operations
 	"""
-	if num_processes is None:
-		num_processes = min(mp.cpu_count(), 8)  # Max 8 parallel DB connections
-
-	if not tax_codes:
-		print("❌ No tax codes provided for PostgreSQL benchmark")
-		return None
-
-	print("\n" + "=" * 60)
-	print("🗄️  BENCHMARK 3: HASH COMPUTATION + POSTGRESQL WRITE")
-	print("=" * 60)
-	print(f"   Tax codes to process: {len(tax_codes):,}")
-	print(f"   Parallel processes: {num_processes}")
-	print(f"   Batch size: {batch_size:,}")
-	print(f"   Table type: {'UNLOGGED' if USE_UNLOGGED_TABLE else 'LOGGED'}")
-
-	# Connection for schema management
 	try:
 		conn_admin = psycopg2.connect(
 			host=POSTGRES_HOST,
@@ -684,14 +706,13 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 		cur_admin = conn_admin.cursor()
 	except Exception as e:
 		print(f"❌ PostgreSQL connection error: {e}")
-		return None
+		return None, None
 
 	print("")
 	print("📋 PRE-INSERT PHASE: Table preparation...")
 
-	# PHASE 0: Verify/convert table type (LOGGED/UNLOGGED)
+	# PHASE 0: Ensure table is LOGGED (production requirement)
 	try:
-		# Check if table exists and determine its type
 		cur_admin.execute("""
 			SELECT relpersistence FROM pg_class
 			WHERE relname = 'codici_fiscali' AND relkind = 'r'
@@ -699,27 +720,21 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 		result = cur_admin.fetchone()
 
 		if result:
-			current_persistence = result[0]  # 'p' = permanent (LOGGED), 'u' = UNLOGGED
+			current_persistence = result[0]
 			is_currently_unlogged = (current_persistence == 'u')
 
-			if USE_UNLOGGED_TABLE and not is_currently_unlogged:
-				print("   - Converting table from LOGGED to UNLOGGED...")
-				cur_admin.execute("ALTER TABLE codici_fiscali SET UNLOGGED")
-				conn_admin.commit()
-				print("   ✓ Table converted to UNLOGGED")
-			elif not USE_UNLOGGED_TABLE and is_currently_unlogged:
-				print("   - Converting table from UNLOGGED to LOGGED...")
+			if is_currently_unlogged:
+				print("   - Converting table from UNLOGGED to LOGGED (production requirement)...")
 				cur_admin.execute("ALTER TABLE codici_fiscali SET LOGGED")
 				conn_admin.commit()
 				print("   ✓ Table converted to LOGGED")
 			else:
-				table_type = "UNLOGGED" if is_currently_unlogged else "LOGGED"
-				print(f"   ✓ Table is already {table_type} (no conversion needed)")
+				print(f"   ✓ Table is already LOGGED (production ready)")
 	except Exception as e:
 		print(f"   ⚠️  Table type verification warning: {e}")
 		conn_admin.rollback()
 
-	# PHASE 1: Drop existing indexes (if present)
+	# PHASE 1: Drop existing indexes
 	print("   - Dropping existing indexes...")
 	try:
 		cur_admin.execute("DROP INDEX IF EXISTS idx_codici_fiscali_cf")
@@ -730,14 +745,103 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 		print(f"   ⚠️  Warning: {e}")
 		conn_admin.rollback()
 
-	# PHASE 2: Set optimal parameters for bulk insert
+	# PHASE 2: TRUNCATE table
+	print("   - Truncating table...")
+	try:
+		cur_admin.execute("TRUNCATE TABLE codici_fiscali")
+		conn_admin.commit()
+		print("   ✓ Table truncated")
+	except Exception as e:
+		print(f"   ⚠️  Warning: {e}")
+		conn_admin.rollback()
+
+	# PHASE 3: Set optimal parameters
 	print("   - Configuring optimal parameters...")
 	cur_admin.execute("SET maintenance_work_mem = '2GB'")
 	print("   ✓ Parameters configured")
 	print("")
 
-	# PHASE 3: Bulk insertion
-	print("📥 HASH + INSERT PHASE: Computing hashes and writing to PostgreSQL...")
+	return cur_admin, conn_admin
+
+
+def postgres_insert_finalize(cur_admin, conn_admin) -> float:
+	"""
+	Finalize PostgreSQL bulk insert: recreate indexes and run ANALYZE.
+
+	Args:
+		cur_admin: Admin cursor
+		conn_admin: Admin connection
+
+	Returns:
+		float: Time spent on finalization (indexes + ANALYZE)
+	"""
+	finalize_start = time.time()
+
+	# PHASE 1: Recreate indexes
+	print("🔨 POST-INSERT PHASE: Index creation...")
+	index_start_time = time.time()
+
+	try:
+		print("   - Creating UNIQUE constraint on codice_fiscale...")
+		cur_admin.execute("ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)")
+		conn_admin.commit()
+
+		index_time = time.time() - index_start_time
+		print(f"   ✓ Index created in {index_time:.2f}s")
+	except Exception as e:
+		print(f"   ✗ Index creation error: {e}")
+		conn_admin.rollback()
+		index_time = 0
+
+	# PHASE 2: ANALYZE
+	print("   - Executing ANALYZE...")
+	analyze_start_time = time.time()
+	cur_admin.execute("ANALYZE codici_fiscali")
+	conn_admin.commit()
+	analyze_time = time.time() - analyze_start_time
+	print(f"   ✓ ANALYZE completed in {analyze_time:.2f}s")
+
+	cur_admin.close()
+	conn_admin.close()
+
+	return time.time() - finalize_start
+
+
+def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = None, tax_codes: List[str] = None, incremental_mode: bool = False) -> Optional[float]:
+	"""
+	BENCHMARK 3: PostgreSQL write operations - computes hashes and writes to PostgreSQL.
+
+	Optimized with COPY FROM STDIN + index management + hash computation.
+
+	Args:
+		batch_size: Size of each batch for write operations
+		num_processes: Number of parallel processes (defaults to min(CPU count, 8))
+		tax_codes: List of tax codes (hashes will be computed)
+		incremental_mode: If True, only performs insert (no init/finalize)
+
+	Returns:
+		float: Total elapsed time in seconds, or None on error
+	"""
+	if num_processes is None:
+		num_processes = min(mp.cpu_count(), 8)
+
+	if not tax_codes:
+		if not incremental_mode:
+			print("❌ No tax codes provided for PostgreSQL benchmark")
+		return None
+
+	if not incremental_mode:
+		print("\n" + "=" * 60)
+		print("🗄️  BENCHMARK 3: HASH COMPUTATION + POSTGRESQL WRITE")
+		print("=" * 60)
+		print(f"   Tax codes to process: {len(tax_codes):,}")
+		print(f"   Parallel processes: {num_processes}")
+		print(f"   Batch size: {batch_size:,}")
+
+	# Bulk insertion phase
+	if not incremental_mode:
+		print("📥 HASH + INSERT PHASE: Computing hashes and writing to PostgreSQL...")
+
 	start_time = time.time()
 
 	# Split data into batches
@@ -753,72 +857,109 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 	insert_time = time.time() - start_time
 	total_count = sum(results)
 
-	print(f"✅ Insert completed: {total_count:,} tax codes in {insert_time:.2f}s")
-	print(f"   Throughput: {total_count / insert_time:,.0f} tax codes/sec")
-	print("")
+	if not incremental_mode:
+		print(f"✅ Insert completed: {total_count:,} tax codes in {insert_time:.2f}s")
+		print(f"   Throughput: {total_count / insert_time:,.0f} tax codes/sec")
+	else:
+		print(f"   ✓ Processed {total_count:,} records in {insert_time:.2f}s ({total_count / insert_time:,.0f} rec/s)")
 
-	# PHASE 4: Recreate indexes
-	print("🔨 POST-INSERT PHASE: Index creation...")
-	index_start_time = time.time()
+	return insert_time
+
+
+def read_from_codici_fiscali_in_batches(mega_batch_size: int = 2_000_000, fetch_batch_size: int = 500_000):
+	"""
+	Generator that yields mega-batches of tax codes from PostgreSQL codici_fiscali table.
+
+	Reads existing tax codes for salt rotation scenario.
+
+	Args:
+		mega_batch_size: Number of records to yield per mega-batch (default: 2M)
+		fetch_batch_size: Number of records to fetch from DB at a time (default: 500k)
+
+	Yields:
+		List[str]: Mega-batch of tax codes (up to mega_batch_size records)
+	"""
+	print(f"📥 Reading tax codes from PostgreSQL codici_fiscali table in mega-batches ({mega_batch_size:,} per batch)...")
+
+	conn = psycopg2.connect(
+		host=POSTGRES_HOST,
+		port=POSTGRES_PORT,
+		database=POSTGRES_DB,
+		user=POSTGRES_USER,
+		password=POSTGRES_PASSWORD
+	)
+
+	# Use named cursor for server-side cursor
+	cur = conn.cursor(name='fetch_codici_fiscali_salt')
+	cur.itersize = fetch_batch_size
 
 	try:
-		# Create UNIQUE constraint on codice_fiscale (automatically creates UNIQUE index)
-		print("   - Creating UNIQUE constraint on codice_fiscale...")
-		cur_admin.execute("ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)")
-		conn_admin.commit()
+		start_time = time.time()
 
-		# Note: hash is already PRIMARY KEY, no need to create additional index
+		# Read only codice_fiscale (we'll recalculate hash with NEW_SALT)
+		cur.execute("SELECT codice_fiscale FROM codici_fiscali ORDER BY codice_fiscale")
 
-		index_time = time.time() - index_start_time
-		print(f"   ✓ Index created in {index_time:.2f}s")
-	except Exception as e:
-		print(f"   ✗ Index creation error: {e}")
-		conn_admin.rollback()
-		index_time = 0
+		mega_batch_buffer = []
+		total_read = 0
+		mega_batch_count = 0
 
-	# PHASE 5: ANALYZE to update statistics
-	print("   - Executing ANALYZE...")
-	analyze_start_time = time.time()
-	cur_admin.execute("ANALYZE codici_fiscali")
-	conn_admin.commit()
-	analyze_time = time.time() - analyze_start_time
-	print(f"   ✓ ANALYZE completed in {analyze_time:.2f}s")
+		while True:
+			rows = cur.fetchmany(fetch_batch_size)
+			if not rows:
+				break
 
-	cur_admin.close()
-	conn_admin.close()
+			# Add fetched rows to buffer
+			mega_batch_buffer.extend([row[0] for row in rows])
+			total_read += len(rows)
 
-	total_time = time.time() - start_time
+			# When buffer reaches mega_batch_size, yield it
+			while len(mega_batch_buffer) >= mega_batch_size:
+				mega_batch_count += 1
+				yield_batch = mega_batch_buffer[:mega_batch_size]
+				mega_batch_buffer = mega_batch_buffer[mega_batch_size:]
 
-	print("")
-	print("📊 SUMMARY:")
-	print(f"   - Data insertion: {insert_time:.2f}s ({total_count / insert_time:,.0f} tax codes/sec)")
-	print(f"   - Index creation: {index_time:.2f}s")
-	print(f"   - ANALYZE: {analyze_time:.2f}s")
-	print(f"   - TOTAL: {total_time:.2f}s")
+				print(f"   📦 Mega-batch {mega_batch_count}: {len(yield_batch):,} records (total read: {total_read:,})")
+				yield yield_batch
 
-	return total_time
+		# Yield remaining records
+		if mega_batch_buffer:
+			mega_batch_count += 1
+			print(f"   📦 Mega-batch {mega_batch_count} (final): {len(mega_batch_buffer):,} records (total read: {total_read:,})")
+			yield mega_batch_buffer
+
+		elapsed = time.time() - start_time
+
+		print(f"✅ Read complete: {total_read:,} tax codes in {elapsed:.2f}s ({mega_batch_count} mega-batches)")
+		print(f"   Throughput: {total_read / elapsed:,.0f} records/sec")
+		print("")
+
+	finally:
+		cur.close()
+		conn.close()
 
 
-def benchmark_postgres_salt_update(batch_size: int = 50_000, num_processes: int = None) -> Optional[float]:
+def benchmark_postgres_salt_update(batch_size: int = 50_000, num_processes: int = None, mega_batch_size: int = 2_000_000) -> Optional[float]:
 	"""
 	BENCHMARK 4: Update PostgreSQL hashes with new salt (salt rotation scenario).
 
-	This benchmark reads existing tax codes from codici_fiscali table,
-	recalculates hashes with NEW_SALT, and updates the database.
+	Uses mega-batch processing: reads from codici_fiscali in chunks, recalculates hashes,
+	and repopulates table using TRUNCATE + COPY strategy.
 
 	Args:
-		batch_size: Size of each batch for UPDATE operations
+		batch_size: Size of each batch for COPY operations
 		num_processes: Number of parallel processes for hash computation
+		mega_batch_size: Size of mega-batches for reading/processing
 
 	Returns:
 		float: Total elapsed time in seconds, or None on error
 	"""
 	print("\n" + "=" * 60)
-	print("🔄 BENCHMARK 4: SALT UPDATE + HASH RECALCULATION")
+	print("🔄 BENCHMARK 4: SALT ROTATION (MEGA-BATCH PROCESSING)")
 	print("=" * 60)
 	print(f"   Old salt: {SALT}")
 	print(f"   New salt: {NEW_SALT}")
-	print(f"   Batch size: {batch_size:,}")
+	print(f"   Mega-batch size: {mega_batch_size:,}")
+	print(f"   COPY batch size: {batch_size:,}")
 	print("")
 
 	# Determine number of processes
@@ -827,183 +968,99 @@ def benchmark_postgres_salt_update(batch_size: int = 50_000, num_processes: int 
 
 	start_time = time.time()
 
-	# PHASE 1: Read existing tax codes from codici_fiscali
-	print("📖 PHASE 1: Reading tax codes from codici_fiscali...")
-	try:
-		conn = psycopg2.connect(
-			host=POSTGRES_HOST,
-			port=POSTGRES_PORT,
-			user=POSTGRES_USER,
-			password=POSTGRES_PASSWORD,
-			database=POSTGRES_DB
-		)
-
-		# Use named cursor for server-side cursor (memory efficient for 65M+ records)
-		cur = conn.cursor(name='fetch_codici_fiscali')
-		cur.itersize = batch_size  # Fetch batch_size rows at a time
-
-		# Select codice_fiscale and old hash
-		cur.execute("SELECT codice_fiscale, hash FROM codici_fiscali")
-
-		tax_codes = []
-		old_hashes = []
-		batch_count = 0
-
-		print("   Reading data in batches using server-side cursor...")
-		while True:
-			rows = cur.fetchmany(batch_size)
-			if not rows:
-				break
-
-			batch_count += 1
-			for row in rows:
-				tax_codes.append(row[0])
-				old_hashes.append(row[1])
-
-			# Progress update every 10 batches
-			if batch_count % 10 == 0:
-				print(f"   Progress: {len(tax_codes):,} records read...")
-
-		cur.close()
-		conn.close()
-
-		read_time = time.time() - start_time
-		print(f"   ✓ Read {len(tax_codes):,} tax codes in {read_time:.2f}s")
-
-		if len(tax_codes) == 0:
-			print("   ⚠️  No tax codes found in codici_fiscali table")
-			print("   Skipping BENCHMARK 4")
-			return None
-
-	except Exception as e:
-		print(f"   ✗ Error reading tax codes: {e}")
+	# Initialize: drop constraint, truncate table
+	print("🔧 INITIALIZATION PHASE...")
+	cur_admin, conn_admin = postgres_insert_init()
+	if not cur_admin:
+		print("❌ Failed to initialize PostgreSQL")
 		return None
 
 	print("")
 
-	# PHASE 2: Recalculate hashes with NEW_SALT in parallel
-	print(f"🔢 PHASE 2: Recalculating hashes with NEW_SALT ({num_processes} processes)...")
-	hash_start_time = time.time()
+	# MEGA-BATCH PROCESSING: Read → Hash → Insert
+	print(f"🔄 PROCESSING PHASE: Reading from cf_raw in mega-batches of {mega_batch_size:,}...")
+	total_read = 0
+	total_hashed = 0
+	total_inserted = 0
+	mega_batch_num = 0
+	total_hash_time = 0.0
+	total_insert_time = 0.0
 
-	# Split tax codes into chunks for parallel processing
-	chunk_size = max(1, len(tax_codes) // num_processes)
-	chunks = [tax_codes[i:i + chunk_size] for i in range(0, len(tax_codes), chunk_size)]
+	for mega_batch_tax_codes in read_tax_codes_from_cf_raw_in_batches(mega_batch_size=mega_batch_size):
+		mega_batch_num += 1
+		total_read += len(mega_batch_tax_codes)
 
-	# Compute new hashes in parallel
-	with mp.Pool(processes=num_processes) as pool:
-		# Use the existing compute_hash_batch_worker with NEW_SALT_BYTES
-		# We need to create a wrapper that uses NEW_SALT_BYTES instead of SALT_BYTES
-		results = pool.map(compute_hash_batch_with_new_salt, chunks)
+		# Recalculate hashes with NEW_SALT for this mega-batch
+		hash_start = time.time()
+		chunk_size = max(1, len(mega_batch_tax_codes) // num_processes)
+		chunks = [mega_batch_tax_codes[i:i + chunk_size] for i in range(0, len(mega_batch_tax_codes), chunk_size)]
 
-	# Flatten results
-	new_hashes = []
-	for result in results:
-		new_hashes.extend(result)
+		with mp.Pool(processes=num_processes) as pool:
+			results = pool.map(compute_hash_batch_with_new_salt, chunks)
 
-	hash_time = time.time() - hash_start_time
-	print(f"   ✓ Recalculated {len(new_hashes):,} hashes in {hash_time:.2f}s")
-	print(f"   Performance: {len(new_hashes) / hash_time:,.0f} hashes/sec")
-	print("")
+		new_hashes = []
+		for result in results:
+			new_hashes.extend(result)
 
-	# PHASE 3: Repopulate PostgreSQL with new hashes (TRUNCATE + COPY strategy)
-	print("💾 PHASE 3: Repopulating PostgreSQL with new hashes...")
-	print("   Strategy: TRUNCATE table + COPY FROM STDIN (10-20x faster than UPDATE)")
-	update_start_time = time.time()
+		hash_time = time.time() - hash_start
+		total_hashed += len(new_hashes)
+		total_hash_time += hash_time
 
-	try:
-		# Connect as admin user for table management
-		conn_admin = psycopg2.connect(
-			host=POSTGRES_HOST,
-			port=POSTGRES_PORT,
-			user=POSTGRES_USER,
-			password=POSTGRES_PASSWORD,
-			database=POSTGRES_DB
-		)
-		conn_admin.autocommit = False
-		cur_admin = conn_admin.cursor()
+		print(f"   🔢 Mega-batch {mega_batch_num}: Hashed {len(new_hashes):,} records in {hash_time:.2f}s ({len(new_hashes) / hash_time:,.0f} hash/s)")
 
-		# Drop UNIQUE constraint before TRUNCATE for maximum performance
-		print("   - Dropping UNIQUE constraint on codice_fiscale...")
-		try:
-			cur_admin.execute("ALTER TABLE codici_fiscali DROP CONSTRAINT IF EXISTS codici_fiscali_codice_fiscale_key")
-			conn_admin.commit()
-			print("   ✓ Constraint dropped")
-		except Exception as e:
-			print(f"   ⚠️  Could not drop constraint (may not exist): {e}")
-			conn_admin.rollback()
+		# Insert this mega-batch with new hashes
+		insert_start = time.time()
+		data_to_insert = list(zip(new_hashes, mega_batch_tax_codes))
 
-		# TRUNCATE table (instantaneous - removes all data)
-		print("   - Truncating codici_fiscali table...")
-		cur_admin.execute("TRUNCATE TABLE codici_fiscali")
-		conn_admin.commit()
-		print("   ✓ Table truncated")
-
-		# Prepare data for insertion: (new_hash, codice_fiscale)
-		data_to_insert = list(zip(new_hashes, tax_codes))
-
-		# Parallel COPY FROM STDIN insertion (same strategy as BENCHMARK 3)
-		print(f"   - Inserting with new hashes using COPY FROM STDIN (batch size: {batch_size:,})...")
-
-		# Split data into batches for parallel processing
+		# Split into batches for parallel COPY
 		batch_data = []
 		for i in range(0, len(data_to_insert), batch_size):
 			batch = data_to_insert[i:i+batch_size]
 			batch_data.append((batch, i // batch_size))
 
-		# Use multiprocessing for parallel COPY operations
-		num_processes = min(mp.cpu_count(), 8)  # Max 8 parallel DB connections
-		chunksize = max(1, len(batch_data) // (num_processes * 8))
+		num_copy_processes = min(mp.cpu_count(), 8)
+		chunksize = max(1, len(batch_data) // (num_copy_processes * 8))
 
-		with mp.Pool(processes=num_processes) as pool:
+		with mp.Pool(processes=num_copy_processes) as pool:
 			results = pool.map(write_salt_update_batch_worker, batch_data, chunksize=chunksize)
 
-		insert_time = time.time() - update_start_time
-		total_inserted = sum(results)
+		insert_time = time.time() - insert_start
+		inserted_count = sum(results)
+		total_inserted += inserted_count
+		total_insert_time += insert_time
 
-		print(f"   ✓ Inserted {total_inserted:,} records with new hashes in {insert_time:.2f}s")
-		print(f"   Performance: {total_inserted / insert_time:,.0f} inserts/sec")
+		print(f"   💾 Mega-batch {mega_batch_num}: Inserted {inserted_count:,} records in {insert_time:.2f}s ({inserted_count / insert_time:,.0f} ins/s)")
 		print("")
 
-		# PHASE 4: Recreate UNIQUE constraint
-		print("   - Recreating UNIQUE constraint on codice_fiscale...")
-		constraint_start_time = time.time()
-		constraint_time = 0
-		try:
-			cur_admin.execute("ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)")
-			conn_admin.commit()
-			constraint_time = time.time() - constraint_start_time
-			print(f"   ✓ Constraint created in {constraint_time:.2f}s")
-		except Exception as e:
-			print(f"   ✗ Constraint creation error: {e}")
-			conn_admin.rollback()
-			constraint_time = 0
+	print(f"✅ All mega-batches processed: {mega_batch_num} batches, {total_read:,} total records")
+	print("")
 
-		print("")
-
-		# PHASE 5: ANALYZE to update statistics
-		print("   - Executing ANALYZE...")
-		analyze_start_time = time.time()
-		cur_admin.execute("ANALYZE codici_fiscali")
-		conn_admin.commit()
-		analyze_time = time.time() - analyze_start_time
-		print(f"   ✓ ANALYZE completed in {analyze_time:.2f}s")
-
+	# Check if cf_raw was empty
+	if total_read == 0:
+		print("⚠️  No records found in cf_raw table")
+		print("   BENCHMARK 4 requires data in cf_raw.")
+		print("   Run BENCHMARK 1bis first to populate cf_raw.")
 		cur_admin.close()
 		conn_admin.close()
-
-	except Exception as e:
-		print(f"   ✗ Error repopulating table: {e}")
 		return None
+
+	# Finalize: recreate constraint, ANALYZE
+	print("🔨 FINALIZATION PHASE...")
+	finalize_time = postgres_insert_finalize(cur_admin, conn_admin)
 
 	total_time = time.time() - start_time
 
 	print("")
 	print("📊 SUMMARY:")
-	print(f"   - Read tax codes: {read_time:.2f}s")
-	print(f"   - Hash recalculation: {hash_time:.2f}s ({len(new_hashes) / hash_time:,.0f} hashes/sec)")
-	print(f"   - Database repopulation: {insert_time:.2f}s ({total_inserted / insert_time:,.0f} inserts/sec)")
-	print(f"   - Constraint creation: {constraint_time:.2f}s")
-	print(f"   - ANALYZE: {analyze_time:.2f}s")
+	print(f"   - Total records processed: {total_read:,}")
+
+	# Avoid division by zero
+	hash_rate = (total_hashed / total_hash_time) if total_hash_time > 0 else 0
+	insert_rate = (total_inserted / total_insert_time) if total_insert_time > 0 else 0
+
+	print(f"   - Hash recalculation: {total_hash_time:.2f}s ({hash_rate:,.0f} hashes/sec)")
+	print(f"   - Database repopulation: {total_insert_time:.2f}s ({insert_rate:,.0f} inserts/sec)")
+	print(f"   - Finalization: {finalize_time:.2f}s")
 	print(f"   - TOTAL: {total_time:.2f}s")
 	print("")
 
@@ -1108,27 +1165,79 @@ def main():
 	if RUN_POSTGRES_CF_WRITE:
 		time_cf_raw_write = benchmark_postgres_cf_raw_write(BATCH_SIZE_CF_RAW, tax_codes=all_tax_codes)
 
-	# Read tax codes from PostgreSQL cf_raw for subsequent benchmarks
-	# Only read from database if we wrote to cf_raw; otherwise use in-memory tax codes
-	if RUN_POSTGRES_CF_WRITE and (RUN_KEYDB or RUN_POSTGRES_INSERT):
-		tax_codes_from_db = read_tax_codes_from_cf_raw()
-	else:
-		tax_codes_from_db = all_tax_codes
+	# Determine source for subsequent benchmarks
+	# If we wrote to cf_raw, use 'db'; otherwise use in-memory list
+	MEGA_BATCH_SIZE = int(os.getenv('MEGA_BATCH_SIZE', '2000000'))  # 2M records per batch
+	source = 'db' if RUN_POSTGRES_CF_WRITE else all_tax_codes
 
 	# BENCHMARK 2: Compute hashes + write to KeyDB (if enabled)
+	# Each benchmark reads independently from source in mega-batches
 	time_keydb = None
 	if RUN_KEYDB:
-		time_keydb = benchmark_keydb(BATCH_SIZE_KEYDB, tax_codes=tax_codes_from_db)
+		print("\n" + "=" * 60)
+		print("📮 BENCHMARK 2: HASH COMPUTATION + KEYDB WRITE")
+		print("=" * 60)
+		print(f"   Source: {'PostgreSQL cf_raw' if source == 'db' else 'In-memory'}")
+		print(f"   Mega-batch size: {MEGA_BATCH_SIZE:,}")
+		print(f"   Batch size: {BATCH_SIZE_KEYDB:,}")
+		print("")
+
+		time_keydb = 0.0
+		mega_batch_num = 0
+
+		for mega_batch in get_tax_codes_in_batches(source, mega_batch_size=MEGA_BATCH_SIZE):
+			mega_batch_num += 1
+			batch_time = benchmark_keydb(BATCH_SIZE_KEYDB, tax_codes=mega_batch, incremental_mode=True)
+			if batch_time:
+				time_keydb += batch_time
+
+		print(f"\n✅ BENCHMARK 2 complete: {mega_batch_num} mega-batches processed")
+		print(f"   Total time: {time_keydb:.2f}s")
 
 	# BENCHMARK 3: Compute hashes + write to PostgreSQL codici_fiscali (if enabled)
+	# Reads independently from source in mega-batches
 	time_postgres = None
 	if RUN_POSTGRES_INSERT:
-		time_postgres = benchmark_postgres_insert(BATCH_SIZE_POSTGRES, tax_codes=tax_codes_from_db)
+		print("\n" + "=" * 60)
+		print("🗄️  BENCHMARK 3: HASH COMPUTATION + POSTGRESQL WRITE")
+		print("=" * 60)
+		print(f"   Source: {'PostgreSQL cf_raw' if source == 'db' else 'In-memory'}")
+		print(f"   Mega-batch size: {MEGA_BATCH_SIZE:,}")
+		print(f"   Batch size: {BATCH_SIZE_POSTGRES:,}")
+		print("")
+
+		# Initialize: drop indexes, truncate, configure
+		cur_admin, conn_admin = postgres_insert_init()
+		if not cur_admin:
+			print("❌ Failed to initialize PostgreSQL")
+			time_postgres = None
+		else:
+			time_postgres = 0.0
+			mega_batch_num = 0
+
+			print("📥 HASH + INSERT PHASE: Computing hashes and writing to PostgreSQL...")
+			for mega_batch in get_tax_codes_in_batches(source, mega_batch_size=MEGA_BATCH_SIZE):
+				mega_batch_num += 1
+				batch_time = benchmark_postgres_insert(BATCH_SIZE_POSTGRES, tax_codes=mega_batch, incremental_mode=True)
+				if batch_time:
+					time_postgres += batch_time
+
+			# Finalize: recreate indexes, ANALYZE
+			finalize_time = postgres_insert_finalize(cur_admin, conn_admin)
+
+			print(f"\n✅ BENCHMARK 3 complete: {mega_batch_num} mega-batches processed")
+			print(f"   Insertion time: {time_postgres:.2f}s")
+			print(f"   Finalization time: {finalize_time:.2f}s")
+			print(f"   Total time: {time_postgres + finalize_time:.2f}s")
 
 	# BENCHMARK 4: Salt update + hash recalculation on PostgreSQL (if enabled)
+	# Uses mega-batch processing to handle 65M+ records efficiently
 	time_salt_update = None
 	if RUN_POSTGRES_SALT_UPDATE:
-		time_salt_update = benchmark_postgres_salt_update(BATCH_SIZE_POSTGRES_UPDATE)
+		time_salt_update = benchmark_postgres_salt_update(
+			batch_size=BATCH_SIZE_POSTGRES_UPDATE,
+			mega_batch_size=MEGA_BATCH_SIZE
+		)
 
 	# Final summary
 	print("\n" + "=" * 60)

@@ -9,10 +9,8 @@ Performance benchmark comparing SHA256 hash computation and write operations on 
 Optimized for benchmarking with UNLOGGED TABLE and fsync=off:
 
 ```bash
-# Launch with benchmark configuration (default)
-docker-compose up -d
 
-# Or use the automated script
+# Use the automated script
 ./run_benchmark.sh
 
 # Execute the benchmark
@@ -27,8 +25,8 @@ Secure configuration with LOGGED TABLE and fsync=on:
 # Launch with production configuration
 docker-compose -f docker-compose.production.yml up -d
 
-# Execute with LOGGED TABLE
-USE_UNLOGGED_TABLE=false python main.py
+# Execute benchmark (always uses LOGGED tables)
+python main.py
 ```
 
 ### Configuration Comparison
@@ -37,10 +35,10 @@ USE_UNLOGGED_TABLE=false python main.py
 |-----------|-----------|------------|
 | PostgreSQL fsync | `off` | `on` |
 | PostgreSQL synchronous_commit | `off` | `on` |
-| codici_fiscali table | UNLOGGED | LOGGED |
+| codici_fiscali table | LOGGED | LOGGED |
 | KeyDB persistence | Disabled | AOF + Snapshot |
-| Insert performance | ~3-5x faster | Normal |
-| Data safety | ⚠️ Risk of loss | ✅ Safe |
+| Insert performance | Fast | Normal |
+| Data safety | ⚠️ Risk of loss (fsync off) | ✅ Safe |
 
 ### Manual Execution
 
@@ -60,23 +58,19 @@ docker-compose -f docker-compose.production.yml up -d
 
 3. Execute the benchmark:
 ```bash
-# With UNLOGGED TABLE (default, faster)
+# Always uses LOGGED tables (production-safe)
 python main.py
-
-# With LOGGED TABLE (safe)
-USE_UNLOGGED_TABLE=false python main.py
 ```
 
 ## Included Benchmarks
 
-**New Architecture** - Tax codes are generated once, stored in PostgreSQL, then read for hash computation:
+**Mega-Batch Architecture** - Scalable to 65M+ records with constant RAM usage (~32MB per mega-batch):
 
-1. **Tax Code Generation** - Generate 6M tax codes in parallel (no hash computation). Stored in memory.
-2. **BENCHMARK 1bis: Write to PostgreSQL cf_raw** - Write tax codes to PostgreSQL `cf_raw` table (no hashes, just raw data)
-3. **Read from PostgreSQL** - Read tax codes from `cf_raw` table for subsequent benchmarks
-4. **BENCHMARK 2: Hash Computation + KeyDB Write** - Read tax codes, compute SHA256 hashes, write to KeyDB
-5. **BENCHMARK 3: Hash Computation + PostgreSQL Write** - Read tax codes, compute SHA256 hashes, write to PostgreSQL `codici_fiscali` table
-6. **BENCHMARK 4: Salt Rotation (optional)** - Recalculate and replace all hashes with new salt using TRUNCATE + COPY strategy (10-20x faster than UPDATE)
+1. **BENCHMARK 1: Tax Code Generation** - Generate 6M tax codes in parallel (no hash computation). Stored in memory.
+2. **BENCHMARK 1bis: Write to PostgreSQL cf_raw** - Write tax codes to `cf_raw` table (immutable source, no hashes)
+3. **BENCHMARK 2: Hash Computation + KeyDB Write** - Read from `cf_raw` in mega-batches (2M at a time), compute SHA256 hashes, write to KeyDB. **Independent loop** - re-reads from `cf_raw`.
+4. **BENCHMARK 3: Hash Computation + PostgreSQL Write** - Read from `cf_raw` in mega-batches, compute SHA256 hashes, write to `codici_fiscali` table. **Independent loop** - re-reads from `cf_raw`.
+5. **BENCHMARK 4: Salt Rotation** - Read from `cf_raw` in mega-batches, recalculate all hashes with NEW_SALT, repopulate `codici_fiscali` using TRUNCATE + COPY strategy (10-20x faster than UPDATE). **Independent execution** - can run anytime after BENCHMARK 1bis.
 
 ---
 
@@ -443,10 +437,6 @@ The benchmark supports configuration via environment variables:
 #### Python (main.py)
 
 ```bash
-# PostgreSQL table type
-USE_UNLOGGED_TABLE=false python main.py  # LOGGED (safe, slower) [default]
-USE_UNLOGGED_TABLE=true python main.py   # UNLOGGED (fast, data loss risk)
-
 # SHA256 hashing salts
 CF_HASH_SALT="custom_salt_2025" python main.py      # Default: CF_ANPR_2025_SALT_KEY
 NEW_SALT="new_salt_2026" python main.py             # For BENCHMARK 4 (salt rotation)
@@ -478,7 +468,6 @@ RUN_POSTGRES_INSERT=false python main.py        # Default: true (BENCHMARK 3)
 RUN_POSTGRES_SALT_UPDATE=false python main.py   # Default: true (BENCHMARK 4 - salt rotation)
 
 # Combined example: custom production configuration
-USE_UNLOGGED_TABLE=false \
 POSTGRES_HOST=pg.prod.example.com \
 POSTGRES_USER=cf_user \
 POSTGRES_PASSWORD=secure_password \
@@ -564,47 +553,16 @@ python main.py
 # You should see ~3-5x speed vs LOGGED
 ```
 
-### Test with LOGGED TABLE (Production)
+### Test with Production Configuration
 
 ```bash
-# 1. Launch production configuration
+# 1. Use production configuration (fsync=on, LOGGED tables)
 docker-compose -f docker-compose.production.yml up -d
 
-# 2. Execute benchmark with LOGGED
-USE_UNLOGGED_TABLE=false python main.py
+# 2. Execute benchmark
+python main.py
 
-# 3. Compare performance
-# Slower insertion but data safe on crash
-```
-
-### A/B Comparison (UNLOGGED vs LOGGED)
-
-```bash
-# Test 1: UNLOGGED (fast)
-docker-compose up -d
-python main.py > results_unlogged.txt
-
-# Clean database
-docker-compose down -v
-docker-compose up -d
-
-# Test 2: LOGGED (safe)
-USE_UNLOGGED_TABLE=false python main.py > results_logged.txt
-
-# Compare results
-diff results_unlogged.txt results_logged.txt
-```
-
-### Test with fsync=on (Production)
-
-```bash
-# 1. Use production configuration (fsync=on)
-docker-compose -f docker-compose.production.yml up -d
-
-# 2. Execute with LOGGED TABLE
-USE_UNLOGGED_TABLE=false python main.py
-
-# Result: safest configuration but slower
+# Result: Production-safe configuration with LOGGED tables
 ```
 
 ---

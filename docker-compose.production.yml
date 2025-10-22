@@ -5,13 +5,13 @@ version: '3.8'
 # ============================================================================
 # This configuration prioritizes DATA SAFETY over performance:
 # - PostgreSQL: fsync=on, synchronous_commit=on (safe writes to disk)
-# - PostgreSQL tables: Use LOGGED tables (set USE_UNLOGGED_TABLE=false)
+# - PostgreSQL tables: Always use LOGGED tables (production-safe)
 # - KeyDB: Persistence ENABLED (AOF + RDB snapshots)
 # - Conservative memory/resource settings
 #
 # Usage:
 #   docker-compose -f docker-compose.production.yml up -d
-#   USE_UNLOGGED_TABLE=false python main.py
+#   python main.py
 # ============================================================================
 
 services:
@@ -92,8 +92,7 @@ services:
     # - checkpoint_timeout=5min: More frequent checkpoints for faster recovery
     # - log_min_duration_statement=1000: Log queries slower than 1 second
     #
-    # IMPORTANT: Remember to also set USE_UNLOGGED_TABLE=false when running:
-    #   USE_UNLOGGED_TABLE=false python main.py
+    # PostgreSQL tables are always LOGGED (production-safe, no configuration needed)
     # Note: Using network_mode: host, so ports are directly exposed on host
     # PostgreSQL will be available at localhost:5432
     volumes:
