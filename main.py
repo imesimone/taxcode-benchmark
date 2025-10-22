@@ -332,29 +332,6 @@ def benchmark_postgres_cf_raw_write(batch_size: int = 50_000, num_processes: int
 	print("")
 	print("📋 PRE-INSERT PHASE: Table preparation...")
 
-	# PHASE 0: Ensure table is LOGGED (production requirement)
-	try:
-		cur_admin.execute("""
-			SELECT relpersistence FROM pg_class
-			WHERE relname = 'cf_raw' AND relkind = 'r'
-		""")
-		result = cur_admin.fetchone()
-
-		if result:
-			current_persistence = result[0]
-			is_currently_unlogged = (current_persistence == 'u')
-
-			if is_currently_unlogged:
-				print("   - Converting table from UNLOGGED to LOGGED (production requirement)...")
-				cur_admin.execute("ALTER TABLE cf_raw SET LOGGED")
-				conn_admin.commit()
-				print("   ✓ Table converted to LOGGED")
-			else:
-				print(f"   ✓ Table is already LOGGED (production ready)")
-	except Exception as e:
-		print(f"   ⚠️  Table type verification warning: {e}")
-		conn_admin.rollback()
-
 	# PHASE 1: Truncate table for fresh insert
 	print("   - Truncating cf_raw table...")
 	try:
@@ -710,29 +687,6 @@ def postgres_insert_init():
 
 	print("")
 	print("📋 PRE-INSERT PHASE: Table preparation...")
-
-	# PHASE 0: Ensure table is LOGGED (production requirement)
-	try:
-		cur_admin.execute("""
-			SELECT relpersistence FROM pg_class
-			WHERE relname = 'codici_fiscali' AND relkind = 'r'
-		""")
-		result = cur_admin.fetchone()
-
-		if result:
-			current_persistence = result[0]
-			is_currently_unlogged = (current_persistence == 'u')
-
-			if is_currently_unlogged:
-				print("   - Converting table from UNLOGGED to LOGGED (production requirement)...")
-				cur_admin.execute("ALTER TABLE codici_fiscali SET LOGGED")
-				conn_admin.commit()
-				print("   ✓ Table converted to LOGGED")
-			else:
-				print(f"   ✓ Table is already LOGGED (production ready)")
-	except Exception as e:
-		print(f"   ⚠️  Table type verification warning: {e}")
-		conn_admin.rollback()
 
 	# PHASE 1: Drop existing indexes
 	print("   - Dropping existing indexes...")

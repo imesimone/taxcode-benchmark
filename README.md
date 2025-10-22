@@ -1,379 +1,114 @@
 # Italian Tax Code (Codice Fiscale) - KeyDB/PostgreSQL Benchmark
 
-Performance benchmark comparing SHA256 hash computation and write operations on KeyDB/PostgreSQL for 6 million Italian tax codes.
+Performance benchmark for SHA256 hash computation and write operations on KeyDB/PostgreSQL using Italian tax codes (Codice Fiscale).
+
+**Key Features**:
+- Scalable to **65M+ records** with constant RAM usage (~32MB per mega-batch)
+- Production-safe: **Always uses LOGGED tables**
+- Parallel hash computation and database writes
+- Independent benchmarks with separate data flows
+
+---
 
 ## Quick Start
 
-### Benchmark Mode (Maximum Performance)
-
-Optimized for benchmarking with UNLOGGED TABLE and fsync=off:
+### Automated Execution
 
 ```bash
-
 # Use the automated script
 ./run_benchmark.sh
-
-# Execute the benchmark
-python main.py
 ```
-
-### Production Mode (Data Safety)
-
-Secure configuration with LOGGED TABLE and fsync=on:
-
-```bash
-# Launch with production configuration
-docker-compose -f docker-compose.production.yml up -d
-
-# Execute benchmark (always uses LOGGED tables)
-python main.py
-```
-
-### Configuration Comparison
-
-| Parameter | Benchmark | Production |
-|-----------|-----------|------------|
-| PostgreSQL fsync | `off` | `on` |
-| PostgreSQL synchronous_commit | `off` | `on` |
-| codici_fiscali table | LOGGED | LOGGED |
-| KeyDB persistence | Disabled | AOF + Snapshot |
-| Insert performance | Fast | Normal |
-| Data safety | ⚠️ Risk of loss (fsync off) | ✅ Safe |
 
 ### Manual Execution
 
-1. Install Python dependencies:
+1. **Install Python dependencies**:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Start Docker containers (choose configuration):
+2. **Start Docker containers**:
 ```bash
-# Benchmark (maximum performance)
 docker-compose up -d
-
-# Production (data safety)
-docker-compose -f docker-compose.production.yml up -d
 ```
 
-3. Execute the benchmark:
+3. **Run the benchmark**:
 ```bash
-# Always uses LOGGED tables (production-safe)
 python main.py
 ```
 
-## Included Benchmarks
+4. **Cleanup** (when done):
+```bash
+# Stop containers
+docker-compose down
 
-**Mega-Batch Architecture** - Scalable to 65M+ records with constant RAM usage (~32MB per mega-batch):
-
-1. **BENCHMARK 1: Tax Code Generation** - Generate 6M tax codes in parallel (no hash computation). Stored in memory.
-2. **BENCHMARK 1bis: Write to PostgreSQL cf_raw** - Write tax codes to `cf_raw` table (immutable source, no hashes)
-3. **BENCHMARK 2: Hash Computation + KeyDB Write** - Read from `cf_raw` in mega-batches (2M at a time), compute SHA256 hashes, write to KeyDB. **Independent loop** - re-reads from `cf_raw`.
-4. **BENCHMARK 3: Hash Computation + PostgreSQL Write** - Read from `cf_raw` in mega-batches, compute SHA256 hashes, write to `codici_fiscali` table. **Independent loop** - re-reads from `cf_raw`.
-5. **BENCHMARK 4: Salt Rotation** - Read from `cf_raw` in mega-batches, recalculate all hashes with NEW_SALT, repopulate `codici_fiscali` using TRUNCATE + COPY strategy (10-20x faster than UPDATE). **Independent execution** - can run anytime after BENCHMARK 1bis.
+# Stop and delete data
+docker-compose down -v
+```
 
 ---
 
-## Performance Optimization Techniques
+## Benchmarks
+
+The benchmark suite includes 5 independent tests:
 
 ### 1. Tax Code Generation
+Generates 6M random Italian tax codes in parallel (no hash computation). Results stored in memory.
 
-#### Problem
-Generating 6 million tax codes is a CPU-intensive operation that can become a bottleneck.
+### 2. Write to PostgreSQL cf_raw
+Writes raw tax codes to `cf_raw` table (immutable source, no hashes). Uses parallel COPY FROM STDIN for maximum throughput.
 
-#### Implemented Solutions
+### 3. Hash Computation + KeyDB Write
+Reads from `cf_raw` in mega-batches (2M at a time), computes SHA256 hashes, writes to KeyDB using pipelined operations.
 
-**A. Single Generation and Reuse**
-```python
-# ❌ SLOW: Generate tax codes multiple times
-benchmark_keydb(6_000_000)  # generates 6M tax codes
-benchmark_postgres(6_000_000)  # regenerates 6M tax codes
+**Independent loop**: Re-reads from `cf_raw` separately.
 
-# ✅ FAST: Generate once, reuse
-all_tax_codes = generate_all_tax_codes(6_000_000)  # generate once
-benchmark_keydb(6_000_000, tax_code_list=all_tax_codes)  # reuse
-benchmark_postgres(6_000_000, tax_code_list=all_tax_codes)  # reuse
+### 4. Hash Computation + PostgreSQL Write
+Reads from `cf_raw` in mega-batches, computes SHA256 hashes, writes to `codici_fiscali` table using parallel COPY.
+
+**Independent loop**: Re-reads from `cf_raw` separately.
+
+### 5. Salt Rotation
+Reads from `cf_raw` in mega-batches, recalculates all hashes with `NEW_SALT`, repopulates `codici_fiscali` using TRUNCATE + COPY strategy (10-20x faster than UPDATE).
+
+**Independent execution**: Can run anytime after benchmark 2.
+
+---
+
+## Mega-Batch Architecture
+
+The benchmark uses **mega-batch processing** to scale to 65M+ records with constant memory usage:
+
+- **Mega-batch size**: 2M records per batch (configurable via `MEGA_BATCH_SIZE`)
+- **Memory footprint**: ~32MB per mega-batch (constant, regardless of total dataset size)
+- **Source independence**: Each benchmark independently re-reads from `cf_raw`
+- **Server-side cursors**: PostgreSQL named cursors with `itersize` for efficient streaming
+
+### Data Flow
+
 ```
-**Gain**: Eliminates unnecessary regeneration, 50% total time savings
+BENCHMARK 1: Generate tax codes in memory
+              ↓
+BENCHMARK 2: Write to cf_raw (immutable source)
+              ↓
+         ┌────┴────┐
+         ↓         ↓
+    BENCHMARK 3   BENCHMARK 4
+    (KeyDB)       (PostgreSQL)
+    reads from    reads from
+    cf_raw        cf_raw
+    independently independently
 
-**B. Pre-computed Patterns and Tuples**
-```python
-# ❌ SLOW: Convert on each iteration
-random.choice(string.ascii_uppercase)  # expensive conversion
-
-# ✅ FAST: Pre-compute tuples
-LETTERS_TUPLE = tuple(string.ascii_uppercase)
-random.choice(LETTERS_TUPLE)  # direct access
-```
-**Gain**: ~15% faster tax code generation
-
-**C. Multiprocessing with Pool.map()**
-```python
-# Use all available CPU cores
-with Pool(processes=cpu_count()) as pool:
-    results = pool.map(generate_tax_code_batch_worker, batch_sizes)
-```
-**Gain**: Linear scalability with CPU count (8 cores → 8x speed)
-
-### 2. SHA256 Hash Computation
-
-#### Problem
-Computing hashes for millions of tax codes requires many encoding and concatenation operations.
-
-#### Implemented Solutions
-
-**A. Pre-encoded Salt**
-```python
-# ❌ SLOW: Encode on each hash
-SALT = "CF_ANPR_2025_SALT_KEY"
-(SALT + tax_code).encode('utf-8')  # repeated encoding
-
-# ✅ FAST: Pre-encoded salt
-SALT_BYTES = SALT.encode('utf-8')  # encode once
-```
-**Gain**: ~10% faster hash computation
-
-**B. Pre-allocated Bytearray**
-```python
-# ❌ SLOW: String concatenation
-data = (SALT + tax_code).encode('utf-8')
-
-# ✅ FAST: Pre-allocated bytearray
-data = bytearray(len(SALT_BYTES) + len(tax_code))
-data[:len(SALT_BYTES)] = SALT_BYTES
-data[len(SALT_BYTES):] = tax_code.encode('utf-8')
-```
-**Gain**: ~5% faster hash computation, fewer memory allocations
-
-### 3. KeyDB - Bulk Insert
-
-#### Problem
-Inserting millions of records one at a time is extremely slow due to network round-trips for each operation.
-
-#### Implemented Solutions
-
-**A. Pipeline with 10k Batches**
-```python
-# ❌ SLOW: Individual SETs
-for hash, tax_code in batch:
-    r.set(hash, tax_code)  # 1 round-trip per record
-
-# ✅ FAST: Pipeline with batching
-pipe = r.pipeline(transaction=False)  # transaction=False = no MULTI/EXEC
-for hash, tax_code in batch:
-    pipe.set(hash, tax_code)  # queued
-pipe.execute()  # 1 round-trip for entire batch
-```
-**Gain**: 50-100x speed (10k operations in 1 round-trip vs 10k round-trips)
-
-**B. transaction=False**
-```python
-# ❌ SLOWER: With MULTI/EXEC transaction
-pipe = r.pipeline(transaction=True)
-
-# ✅ FAST: Without transactional overhead
-pipe = r.pipeline(transaction=False)
-```
-**Gain**: ~20-30% pipeline speed improvement
-
-**C. Connection Pool**
-```python
-# ❌ SLOW: New connection per worker
-r = redis.Redis(host=KEYDB_HOST, port=KEYDB_PORT)
-
-# ✅ FAST: Global connection pool
-_redis_pool = redis.ConnectionPool(
-    host=KEYDB_HOST,
-    max_connections=50,
-    socket_keepalive=True
-)
-r = redis.Redis(connection_pool=_redis_pool)
-```
-**Gain**: ~15% speed improvement, reduced connection overhead
-
-**D. Persistence Disabled During Insert**
-```yaml
-# docker-compose.yml
-command: >
-  --save ""              # Disable RDB snapshots
-  --appendonly no        # Disable AOF
-```
-**Gain**: 2-3x faster insertion (no fsync to disk)
-
-**Note**: Manual `SAVE` is executed after benchmark to persist data
-
-### 4. PostgreSQL - Bulk Insert
-
-#### Problem
-Classic INSERT statements are slow for large volumes. Indexes further slow down insertions.
-
-#### Implemented Solutions
-
-**A. COPY FROM STDIN Instead of INSERT**
-```python
-# ❌ SLOW: INSERT with execute_values
-execute_values(cur, "INSERT INTO codici_fiscali (codice_fiscale, hash) VALUES %s", batch)
-
-# ✅ FAST: COPY FROM STDIN
-buffer = io.StringIO()
-for tax_code, hash in batch:
-    buffer.write(f"{tax_code},{hash}\n")
-buffer.seek(0)
-cur.copy_expert(
-    "COPY codici_fiscali (codice_fiscale, hash) FROM STDIN WITH (FORMAT CSV)",
-    buffer
-)
-```
-**Gain**: 2-5x faster insertion
-
-**B. Drop Indexes Before, Recreate After**
-```python
-# PHASE 1: Drop indexes BEFORE bulk insert
-cur.execute("DROP INDEX IF EXISTS idx_codici_fiscali_hash")
-cur.execute("ALTER TABLE codici_fiscali DROP CONSTRAINT IF EXISTS codici_fiscali_codice_fiscale_key")
-
-# PHASE 2: Bulk insertion (without index overhead)
-# ... COPY FROM STDIN ...
-
-# PHASE 3: Recreate indexes AFTER bulk insert
-cur.execute("ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)")
-cur.execute("CREATE UNIQUE INDEX idx_codici_fiscali_hash ON codici_fiscali(hash)")
-```
-**Gain**: 3-10x faster insertion (depends on number of indexes)
-
-**C. UNLOGGED TABLE**
-```sql
-CREATE UNLOGGED TABLE codici_fiscali (
-    id SERIAL PRIMARY KEY,
-    codice_fiscale VARCHAR(16) NOT NULL,
-    hash VARCHAR(64) NOT NULL
-);
-```
-**Gain**: 2-3x faster insertion (no WAL)
-
-**⚠️ WARNING**: UNLOGGED TABLE loses data on PostgreSQL crash. Do not use in production for critical data.
-
-**D. Optimized PostgreSQL Parameters**
-```yaml
-# docker-compose.yml
-POSTGRES_INITDB_ARGS: >
-  -c fsync=off
-  -c synchronous_commit=off
-  -c full_page_writes=off
-```
-```python
-# main.py
-cur.execute("SET maintenance_work_mem = '2GB'")  # For fast index creation
-```
-**Gain**: 1.5-2x overall speed improvement
-
-**⚠️ WARNING**: fsync=off risks data corruption on crash. Benchmark only.
-
-**E. ANALYZE After Bulk Insert**
-```python
-cur.execute("ANALYZE codici_fiscali")
-```
-**Benefit**: Updates query planner statistics for optimal future queries
-
-**F. Client-side Pre-computed Hashes**
-```python
-# Compute hashes in Python before insertion
-for tax_code in tax_code_list:
-    hash_val = compute_sha256_hash(tax_code)
-    buffer.write(f"{tax_code},{hash_val}\n")
-```
-**Benefits**:
-- Distributes CPU load (PostgreSQL doesn't compute hashes)
-- Reduces database CPU usage during bulk insert operations
-
-### 5. PostgreSQL - Salt Rotation (BENCHMARK 4)
-
-#### Problem
-When you need to update the hashing salt for security reasons, you must recalculate all 6M+ hashes and update the database. Traditional UPDATE operations are extremely slow because:
-- PostgreSQL must reorganize the PRIMARY KEY index (hash column) for every update
-- Each UPDATE creates dead tuples (MVCC overhead)
-- UPDATE with JOIN on millions of rows has significant overhead
-
-**Naive UPDATE approach**: ~15,000 updates/sec (404 seconds for 6M records)
-
-#### Implemented Solution
-
-**TRUNCATE + COPY Strategy** (10-20x faster than UPDATE):
-
-```python
-# ❌ SLOW: UPDATE with JOIN (15k updates/sec)
-UPDATE codici_fiscali
-SET hash = new_hash
-FROM temp_table
-WHERE codici_fiscali.codice_fiscale = temp_table.codice_fiscale
-
-# ✅ FAST: TRUNCATE + COPY (150k-200k inserts/sec)
-# Step 1: Read existing tax codes from database
-tax_codes = read_from_db()
-
-# Step 2: Recalculate all hashes with NEW_SALT (parallel)
-new_hashes = parallel_hash_computation(tax_codes, NEW_SALT)
-
-# Step 3: Drop constraint
-ALTER TABLE codici_fiscali DROP CONSTRAINT codici_fiscali_codice_fiscale_key
-
-# Step 4: TRUNCATE table (instantaneous)
-TRUNCATE TABLE codici_fiscali
-
-# Step 5: Repopulate with COPY FROM STDIN (parallel, same as BENCHMARK 3)
-COPY codici_fiscali (hash, codice_fiscale) FROM STDIN
-
-# Step 6: Recreate constraint
-ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)
+         BENCHMARK 5
+         (Salt Rotation)
+         reads from cf_raw
+         independently
 ```
 
-**Why This Works**:
-1. **TRUNCATE is instantaneous** - just marks all pages as free (no row-by-row deletion)
-2. **COPY is 10-20x faster** than UPDATE - optimized bulk loading path in PostgreSQL
-3. **No MVCC overhead** - no dead tuples, no bloat
-4. **No index reorganization during insert** - constraint is dropped, recreated at the end
-5. **Parallel processing** - same multiprocessing strategy as BENCHMARK 3
-
-**Trade-offs**:
-- ✅ **Much faster**: 404s → ~30-40s (10x improvement)
-- ✅ **No table bloat**: fresh data, no dead tuples
-- ⚠️ **Requires downtime**: table is empty during repopulation
-- ⚠️ **All-or-nothing**: can't update a subset of records
-
-**Use Case**: Perfect for scheduled maintenance windows when you need to rotate salt keys for security compliance.
-
-**Performance Comparison**:
-```
-UPDATE approach:  404.42s (14,836 updates/sec)
-TRUNCATE + COPY:  ~30-40s (150,000-200,000 inserts/sec)
-Speedup:          ~10-13x faster
-```
-
-### 6. Multiprocessing
-
-#### Problem
-Python GIL (Global Interpreter Lock) limits parallelism on CPU-intensive operations in threads.
-
-#### Implemented Solution
-
-**A. multiprocessing.Pool with map()**
-```python
-# ❌ SLOW: Single process
-for batch in batches:
-    write_postgres_batch_worker(batch)
-
-# ✅ FAST: Parallelism with Pool
-with Pool(processes=cpu_count()) as pool:
-    results = pool.map(write_postgres_batch_worker, batches)
-```
-**Gain**: Linear scalability (8 CPUs = ~8x speed)
-
-**B. Optimized Chunksize**
-```python
-chunksize = max(1, len(batches) // (num_processes * 4))
-pool.map(worker, batches, chunksize=chunksize)
-```
-**Benefit**: Reduces IPC (Inter-Process Communication) overhead
+Each benchmark (3, 4, 5) processes data in mega-batches:
+1. Read 2M tax codes from `cf_raw`
+2. Process (hash computation)
+3. Write to target database
+4. Repeat until all data processed
 
 ---
 
@@ -381,225 +116,343 @@ pool.map(worker, batches, chunksize=chunksize)
 
 ### PostgreSQL
 
-#### Table `cf_raw` (Raw Tax Codes - UNLOGGED)
+#### Table: `cf_raw`
 ```sql
-CREATE UNLOGGED TABLE cf_raw (
+CREATE TABLE cf_raw (
     codice_fiscale VARCHAR(16) PRIMARY KEY
 );
 ```
-**Purpose**: Stores raw Italian tax codes without hashes. Source data for benchmarks 2 and 3.
+**Purpose**: Immutable source of raw tax codes (no hashes). Used by benchmarks 3, 4, and 5.
 
-#### Table `codici_fiscali` (Tax Codes with Hashes - UNLOGGED)
+**Note**: Always LOGGED (production-safe).
+
+#### Table: `codici_fiscali`
 ```sql
-CREATE UNLOGGED TABLE codici_fiscali (
+CREATE TABLE codici_fiscali (
     hash VARCHAR(64) PRIMARY KEY,
-    codice_fiscale VARCHAR(16) NOT NULL
+    codice_fiscale VARCHAR(16) NOT NULL UNIQUE
 );
--- Index (created after bulk insert):
--- - UNIQUE constraint on codice_fiscale
 ```
-
 **Structure**:
-- `hash` (VARCHAR 64): SHA256 hash - PRIMARY KEY
-- `codice_fiscale` (VARCHAR 16): Italian tax code - UNIQUE
+- `hash`: SHA256 hash (computed client-side)
+- `codice_fiscale`: Italian tax code (16 chars)
 
-**Hash**: Computed in Python (client-side) during insertion
+**Note**: Always LOGGED (production-safe).
 
 ### KeyDB
 
-**Key-value structure**:
-- Key: SHA256 hash (VARCHAR 64) - computed in Python
-- Value: tax code (VARCHAR 16)
+**KeyDB** is a high-performance, multi-threaded, Redis-compatible in-memory database. Fully compatible with Redis protocol and commands.
 
-Example:
-```
-"a1b2c3d4..." → "RSSMRA80A01H501U"
-```
+**Key-Value structure**:
+- **Key**: SHA256 hash (64 chars)
+- **Value**: Tax code (16 chars)
 
----
-
-## Why KeyDB?
-
-KeyDB is a multithreaded fork of Redis that offers:
-- Superior performance (up to 5x faster on multi-core workloads)
-- 100% Redis compatibility (same protocol, same commands)
-- Native multithreading (4 threads configured for max throughput)
-- Dynamic configuration via `--server-threads` and `--server-thread-affinity`
+**Why KeyDB**: Multi-threaded architecture provides better performance than Redis on multi-core systems, while maintaining 100% Redis compatibility.
 
 ---
 
-## Parametric Configuration
+## Configuration
 
-### Available Environment Variables
+### Environment Variables
 
-The benchmark supports configuration via environment variables:
-
-#### Python (main.py)
-
-```bash
-# SHA256 hashing salts
-CF_HASH_SALT="custom_salt_2025" python main.py      # Default: CF_ANPR_2025_SALT_KEY
-NEW_SALT="new_salt_2026" python main.py             # For BENCHMARK 4 (salt rotation)
-
-# KeyDB connections
-KEYDB_HOST=redis.example.com python main.py   # Default: localhost
-KEYDB_PORT=6380 python main.py                # Default: 6379
-KEYDB_DB=1 python main.py                     # Default: 0
-
-# PostgreSQL connections
-POSTGRES_HOST=pg.example.com python main.py   # Default: localhost
-POSTGRES_PORT=5433 python main.py             # Default: 5432
-POSTGRES_DB=cf_benchmark python main.py       # Default: cf_benchmark
-POSTGRES_USER=myuser python main.py           # Default: postgres
-POSTGRES_PASSWORD=mypass python main.py       # Default: postgres
-
-# Benchmark parameters
-TOTAL_IDS=1000000 python main.py                      # Default: 6000000
-BATCH_SIZE_COMPUTATION=50000 python main.py           # Default: 100000
-BATCH_SIZE_CF_RAW=25000 python main.py                # Default: 50000
-BATCH_SIZE_KEYDB=5000 python main.py                  # Default: 10000
-BATCH_SIZE_POSTGRES=25000 python main.py              # Default: 50000
-BATCH_SIZE_POSTGRES_UPDATE=25000 python main.py       # Default: 50000
-
-# Enable/disable individual benchmarks
-RUN_POSTGRES_CF_WRITE=false python main.py      # Default: true (BENCHMARK 1bis)
-RUN_KEYDB=false python main.py                  # Default: true (BENCHMARK 2)
-RUN_POSTGRES_INSERT=false python main.py        # Default: true (BENCHMARK 3)
-RUN_POSTGRES_SALT_UPDATE=false python main.py   # Default: true (BENCHMARK 4 - salt rotation)
-
-# Combined example: custom production configuration
-POSTGRES_HOST=pg.prod.example.com \
-POSTGRES_USER=cf_user \
-POSTGRES_PASSWORD=secure_password \
-CF_HASH_SALT="production_salt_2025" \
-python main.py
-
-# Example: Quick test with 100k records, KeyDB only
-TOTAL_IDS=100000 \
-RUN_POSTGRES_CF_WRITE=false \
-RUN_POSTGRES_INSERT=false \
-python main.py
-
-# Example: Test salt rotation (BENCHMARK 4 only)
-# Note: Requires existing data in codici_fiscali table (run BENCHMARK 3 first)
-# Uses TRUNCATE + COPY strategy (10x faster than UPDATE)
-RUN_POSTGRES_CF_WRITE=false \
-RUN_KEYDB=false \
-RUN_POSTGRES_INSERT=false \
-RUN_POSTGRES_SALT_UPDATE=true \
-NEW_SALT="CF_ANPR_2026_NEW_SALT" \
-python main.py
-
-# Example: Full pipeline including salt rotation
-# Runs all benchmarks in sequence: generate → write → KeyDB → PostgreSQL → salt rotation
-python main.py
-```
-
-**Notes**:
-- Code automatically detects current table type
-- If needed, converts table from LOGGED ↔ UNLOGGED before benchmark
-- Conversion time is proportional to table size
-- All variables have reasonable defaults for local environment
-- Salt is configurable for different environments (dev/staging/prod)
-- Benchmark parameters allow customization of dataset size and batch sizes
-- Individual benchmarks can be enabled/disabled via flags
-
-#### Docker Compose
+#### Connection Parameters
 
 ```bash
 # KeyDB
-export KEYDB_MEMORY=16gb
-export KEYDB_THREADS=8
+KEYDB_HOST=localhost          # Default: localhost
+KEYDB_PORT=6379               # Default: 6379
+KEYDB_DB=0                    # Default: 0
 
 # PostgreSQL
+POSTGRES_HOST=localhost       # Default: localhost
+POSTGRES_PORT=5432            # Default: 5432
+POSTGRES_DB=cf_benchmark      # Default: cf_benchmark
+POSTGRES_USER=postgres        # Default: postgres
+POSTGRES_PASSWORD=postgres    # Default: postgres
+```
+
+#### Hashing Salts
+
+```bash
+CF_HASH_SALT="custom_salt_2025"    # Default: CF_ANPR_2025_SALT_KEY
+NEW_SALT="new_salt_2026"           # For salt rotation (benchmark 5)
+```
+
+#### Benchmark Parameters
+
+```bash
+TOTAL_IDS=6000000                      # Total tax codes to generate
+MEGA_BATCH_SIZE=2000000                # Records per mega-batch
+BATCH_SIZE_COMPUTATION=100000          # Batch size for generation
+BATCH_SIZE_CF_RAW=50000                # Batch size for cf_raw writes
+BATCH_SIZE_KEYDB=10000                 # Batch size for KeyDB writes
+BATCH_SIZE_POSTGRES=50000              # Batch size for PostgreSQL writes
+BATCH_SIZE_POSTGRES_UPDATE=50000       # Batch size for salt rotation
+```
+
+#### Enable/Disable Benchmarks
+
+```bash
+RUN_POSTGRES_CF_WRITE=true       # Benchmark 2 (cf_raw write)
+RUN_KEYDB=true                   # Benchmark 3 (KeyDB)
+RUN_POSTGRES_INSERT=true         # Benchmark 4 (PostgreSQL)
+RUN_POSTGRES_SALT_UPDATE=true    # Benchmark 5 (salt rotation)
+```
+
+### Example: Custom Configuration
+
+```bash
+# Production-like configuration
+TOTAL_IDS=10000000 \
+POSTGRES_HOST=pg.example.com \
+POSTGRES_USER=cf_user \
+POSTGRES_PASSWORD=secure_pass \
+CF_HASH_SALT="production_salt_2025" \
+python main.py
+```
+
+### Example: Quick Test (100k records, KeyDB only)
+
+```bash
+TOTAL_IDS=100000 \
+RUN_POSTGRES_CF_WRITE=false \
+RUN_POSTGRES_INSERT=false \
+RUN_POSTGRES_SALT_UPDATE=false \
+python main.py
+```
+
+---
+
+## Performance Optimizations
+
+### 1. Parallel Hash Computation
+Uses Python `multiprocessing.Pool` to distribute hash computation across all CPU cores.
+
+### 2. PostgreSQL COPY FROM STDIN
+Bulk insert using `COPY` protocol (2-5x faster than INSERT statements).
+
+### 3. Index Management
+Drops indexes before bulk insert, recreates after. Dramatically faster for large datasets.
+
+### 4. KeyDB Pipelining
+Batches 10k SET operations in a single pipeline (eliminates network round-trips).
+
+### 5. Connection Pooling
+Reuses database connections across workers (reduces connection overhead).
+
+### 6. Server-Side Cursors
+PostgreSQL named cursors with `itersize` for memory-efficient data streaming.
+
+### 7. Mega-Batch Processing
+Processes data in 2M-record chunks to maintain constant memory usage regardless of dataset size.
+
+---
+
+## Salt Rotation Strategy (Benchmark 5)
+
+### Problem
+When rotating hashing salt, all hashes must be recalculated. Traditional UPDATE approach is slow:
+
+```sql
+-- ❌ SLOW: UPDATE on PRIMARY KEY (404s for 6M records)
+UPDATE codici_fiscali
+SET hash = new_hash
+WHERE codice_fiscale = cf
+```
+
+**Why slow**: PostgreSQL must reorganize the B-tree index for every row (hash is PRIMARY KEY).
+
+### Solution: TRUNCATE + COPY
+
+```sql
+-- ✅ FAST: TRUNCATE entire table + bulk insert (40s for 6M records)
+TRUNCATE TABLE codici_fiscali;
+COPY codici_fiscali (hash, codice_fiscale) FROM STDIN;
+```
+
+**Performance**: 10-20x faster than UPDATE approach.
+
+**Strategy**:
+1. Drop UNIQUE constraint on `codice_fiscale`
+2. TRUNCATE table
+3. Read tax codes from `cf_raw` in mega-batches
+4. Recalculate hashes with `NEW_SALT`
+5. Bulk insert using parallel COPY
+6. Recreate UNIQUE constraint
+7. Run ANALYZE
+
+---
+
+## Technical Details
+
+### Tax Code Format
+
+Italian Tax Code (Codice Fiscale): 16 alphanumeric characters
+
+**Pattern**: `LLLLLLDDLDDLDDDL`
+- `L` = Letter (A-Z)
+- `D` = Digit (0-9)
+
+**Example**: `RSSMRA85M01H501X`
+
+### Hash Computation
+
+```python
+hash = SHA256(tax_code + salt).hexdigest()
+```
+
+- **Algorithm**: SHA256
+- **Salt**: Configurable via `CF_HASH_SALT` environment variable
+- **Output**: 64-character hexadecimal string
+
+---
+
+## Docker Compose Configuration
+
+### KeyDB Settings
+
+```bash
+export KEYDB_MEMORY=16gb    # Max memory
+export KEYDB_THREADS=8      # Server threads
+```
+
+### PostgreSQL Settings
+
+PostgreSQL memory parameters have a significant impact on performance. Configure them based on your available RAM:
+
+```bash
+export PG_SHARED_BUFFERS=8GB          # Default: 8GB
+export PG_WORK_MEM=256MB              # Default: 256MB
+export PG_MAINTENANCE_WORK_MEM=2GB    # Default: 2GB
+export PG_EFFECTIVE_CACHE_SIZE=16GB   # Default: 16GB
+export PG_MAX_WAL_SIZE=4GB            # Default: 4GB
+```
+
+#### Memory Parameters Explained
+
+**`shared_buffers`** (Default: 8GB)
+- PostgreSQL's main memory buffer for caching data pages
+- Used for reading and writing data blocks
+- **Recommendation**: 25% of total RAM (e.g., 8GB for 32GB system)
+- Higher values reduce disk I/O by keeping more data in memory
+- Too high can cause performance degradation (leaves less RAM for OS cache)
+
+**`work_mem`** (Default: 256MB)
+- Memory allocated for **each** sort/hash operation in a query
+- Multiple operations in a query can each use this amount
+- **Recommendation**: Start with 256MB, monitor with complex queries
+- Too low: Disk-based sorts (slow)
+- Too high: Risk of OOM with many concurrent operations
+- **Formula**: Available RAM / (max_connections × 2-3 operations per query)
+
+**`maintenance_work_mem`** (Default: 2GB)
+- Memory for maintenance operations: CREATE INDEX, ANALYZE, VACUUM
+- Only one maintenance operation uses this at a time
+- **Recommendation**: 1-2GB, or up to 2GB for large datasets
+- Critical for index creation after bulk inserts (our use case)
+- Higher values = faster index creation and ANALYZE
+
+**`effective_cache_size`** (Default: 16GB)
+- Estimate of memory available for disk caching (PostgreSQL + OS cache)
+- Does NOT allocate memory, just helps query planner
+- **Recommendation**: 50-75% of total RAM
+- Example: 16GB for 32GB system, 32GB for 64GB system
+- Influences whether PostgreSQL uses indexes or sequential scans
+
+**`max_wal_size`** (Default: 4GB)
+- Maximum size of Write-Ahead Log before checkpoint is triggered
+- Larger values = less frequent checkpoints (better for bulk inserts)
+- **Recommendation**: 2-4GB for bulk operations
+- Trade-off: Larger WAL = longer recovery time after crash
+
+#### Tuning for This Benchmark
+
+For **bulk insert performance** (benchmarks 2, 3, 4):
+- Increase `maintenance_work_mem` to speed up index creation
+- Increase `max_wal_size` to reduce checkpoint frequency
+- Increase `shared_buffers` to cache more data during writes
+
+Example for a 32GB RAM system running bulk inserts:
+```bash
 export PG_SHARED_BUFFERS=8GB
 export PG_WORK_MEM=256MB
 export PG_MAINTENANCE_WORK_MEM=2GB
-export PG_EFFECTIVE_CACHE_SIZE=16GB
+export PG_EFFECTIVE_CACHE_SIZE=20GB
 export PG_MAX_WAL_SIZE=4GB
 
-# Start containers with custom configuration
 docker-compose up -d
 ```
 
-The `run_benchmark.sh` script automatically configures these parameters based on available resources.
-
-## Quick Test
-
-For a quick test with 100k records instead of 6 million:
-
+Example for a 64GB RAM system:
 ```bash
-# Using environment variable (recommended)
-TOTAL_IDS=100000 python main.py
+export PG_SHARED_BUFFERS=16GB
+export PG_WORK_MEM=512MB
+export PG_MAINTENANCE_WORK_MEM=4GB
+export PG_EFFECTIVE_CACHE_SIZE=40GB
+export PG_MAX_WAL_SIZE=8GB
 
-# Or run only specific benchmarks (e.g., only KeyDB)
-TOTAL_IDS=100000 RUN_POSTGRES_INSERT=false python main.py
-```
-
----
-
-## Usage Examples
-
-### Test with UNLOGGED TABLE (Maximum Performance)
-
-```bash
-# 1. Launch benchmark configuration
 docker-compose up -d
-
-# 2. Execute benchmark with UNLOGGED
-python main.py
-
-# 3. Verify performance
-# You should see ~3-5x speed vs LOGGED
-```
-
-### Test with Production Configuration
-
-```bash
-# 1. Use production configuration (fsync=on, LOGGED tables)
-docker-compose -f docker-compose.production.yml up -d
-
-# 2. Execute benchmark
-python main.py
-
-# Result: Production-safe configuration with LOGGED tables
 ```
 
 ---
 
-## Cleanup
+## Important Notes
 
-```bash
-# Stop containers
-docker-compose down
+### Production Safety
 
-# Stop containers and delete data
-docker-compose down -v
+✅ **Always uses LOGGED tables** - Tables defined in `init.sql` are production-safe
+✅ **Configurable salts** - Use environment variables for different environments
+✅ **Independent benchmarks** - Can enable/disable via flags
+✅ **Constant memory usage** - Mega-batch architecture scales to 65M+ records
 
-# Stop production configuration
-docker-compose -f docker-compose.production.yml down -v
-```
+### Scalability
+
+The mega-batch architecture ensures:
+- **Constant memory usage** (~32MB per batch) regardless of total dataset
+- **Tested up to 65M records**
+- **Linear scaling** with dataset size
 
 ---
 
-## Important Production Notes
+## Troubleshooting
 
-**⚠️ WARNING**: This project is optimized for **maximum performance benchmarking**.
+### Out of Memory
 
-The following practices are **NOT safe for production environments**:
+If you encounter OOM errors:
+1. Reduce `MEGA_BATCH_SIZE` (default: 2M)
+2. Reduce `BATCH_SIZE_*` parameters
+3. Increase available RAM
 
-1. **UNLOGGED TABLE**: Data is lost on PostgreSQL crash
-2. **fsync=off**: Risk of data corruption
-3. **KeyDB without persistence**: Data lost on restart
-4. **Hardcoded credentials**: Passwords in plain text in code
+### Slow Performance
 
-**For production**:
-- Use normal LOGGED tables
-- Enable fsync and synchronous_commit
-- Enable AOF on KeyDB (`--appendonly yes`)
-- Use environment variables for credentials
-- Implement automated backups
-- Add monitoring and alerting
-- Implement retry logic and robust error handling
+1. Check CPU usage (should be near 100% during hash computation)
+2. Verify disk I/O (SSD recommended for large datasets)
+3. Adjust PostgreSQL memory parameters
+4. Increase `KEYDB_THREADS` for KeyDB
 
-Bulk insert optimization practices (COPY FROM STDIN, temporary index removal, Redis Pipeline) are valid for production during scheduled ETL operations.
+### Connection Errors
+
+1. Verify Docker containers are running: `docker ps`
+2. Check PostgreSQL logs: `docker logs cf_postgres`
+3. Check KeyDB logs: `docker logs cf_keydb`
+4. Verify network connectivity: `nc -zv localhost 5432`
+
+---
+
+## License
+
+**CC0 1.0 Universal (Public Domain)**
+
+This work has been dedicated to the public domain. You can copy, modify, distribute and perform the work, even for commercial purposes, all without asking permission.
+
+See [LICENSE](https://creativecommons.org/publicdomain/zero/1.0/) for details.
+
+Do whatever you want with this code.
+
+---
+
+## Credits
+
+Benchmark optimizations based on PostgreSQL and Redis best practices for bulk data operations.
+
+**KeyDB** is a high-performance, Redis-compatible database with multi-threading support. Fully compatible with Redis protocol and commands.
