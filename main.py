@@ -15,8 +15,12 @@ import string
 import time
 from typing import List, Tuple, Optional
 
+from dotenv import load_dotenv
 import psycopg2
 import redis
+
+# Load environment variables from .env file
+load_dotenv()
 
 LETTERS = string.ascii_uppercase
 DIGITS = string.digits

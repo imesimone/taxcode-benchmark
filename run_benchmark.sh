@@ -7,7 +7,7 @@ set -e  # Exit immediately on error
 # ============================================================================
 
 echo "=========================================="
-echo "🚀 BENCHMARK: CF -> SHA256 HASH"
+echo "🚀 BENCHMARK: TAX CODE -> SHA256 HASH"
 echo "=========================================="
 echo ""
 
@@ -20,7 +20,7 @@ OS=$(uname -s)
 echo "📊 Detecting available resources..."
 echo ""
 
-# Detect CPU count
+# Detect CPU count and RAM based on OS
 if [[ "$OS" == "Darwin" ]]; then
     # macOS
     CPU_COUNT=$(sysctl -n hw.ncpu)
@@ -29,8 +29,22 @@ elif [[ "$OS" == "Linux" ]]; then
     # Linux
     CPU_COUNT=$(nproc)
     TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+elif [[ "$OS" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
+    # Windows (Git Bash, MSYS2, Cygwin)
+    echo "   Detected Windows environment"
+    # CPU count from NUMBER_OF_PROCESSORS environment variable
+    CPU_COUNT=${NUMBER_OF_PROCESSORS:-4}
+    # RAM detection using wmic (if available)
+    if command -v wmic.exe &> /dev/null; then
+        TOTAL_RAM_BYTES=$(wmic.exe computersystem get TotalPhysicalMemory | sed -n '2p' | tr -d '\r\n ')
+        TOTAL_RAM_GB=$((TOTAL_RAM_BYTES / 1024 / 1024 / 1024))
+    else
+        echo "   ⚠️  wmic not available, using default RAM value"
+        TOTAL_RAM_GB=16
+    fi
 else
-    echo "⚠️  Unrecognized operating system, using default values"
+    echo "⚠️  Unrecognized operating system: $OS"
+    echo "   Using default values"
     CPU_COUNT=4
     TOTAL_RAM_GB=16
 fi
@@ -47,30 +61,33 @@ echo ""
 
 # KeyDB: use all CPUs, 40% of RAM
 export KEYDB_THREADS=$CPU_COUNT
-KEYDB_MEMORY_GB=$(echo "$TOTAL_RAM_GB * 0.4" | bc | awk '{print int($1)}')
+KEYDB_MEMORY_GB=$(( TOTAL_RAM_GB * 40 / 100 ))
+[ $KEYDB_MEMORY_GB -lt 1 ] && KEYDB_MEMORY_GB=1
 export KEYDB_MEMORY="${KEYDB_MEMORY_GB}gb"
 
 # PostgreSQL: optimal configuration following best practices
 # shared_buffers: 25% of RAM (max 40% if PostgreSQL only)
-PG_SHARED_BUFFERS_GB=$(echo "$TOTAL_RAM_GB * 0.25" | bc | awk '{print int($1)}')
+PG_SHARED_BUFFERS_GB=$(( TOTAL_RAM_GB * 25 / 100 ))
+[ $PG_SHARED_BUFFERS_GB -lt 1 ] && PG_SHARED_BUFFERS_GB=1
 export PG_SHARED_BUFFERS="${PG_SHARED_BUFFERS_GB}GB"
 
 # work_mem: RAM / (max_connections * 2), min 256MB
-PG_WORK_MEM_MB=$(echo "$TOTAL_RAM_GB * 1024 / 400" | bc | awk '{print int($1)}')
+PG_WORK_MEM_MB=$(( TOTAL_RAM_GB * 1024 / 400 ))
 if [ $PG_WORK_MEM_MB -lt 256 ]; then
     PG_WORK_MEM_MB=256
 fi
 export PG_WORK_MEM="${PG_WORK_MEM_MB}MB"
 
 # maintenance_work_mem: 5% of RAM or 2GB, whichever is greater
-PG_MAINTENANCE_GB=$(echo "$TOTAL_RAM_GB * 0.05" | bc | awk '{print int($1)}')
+PG_MAINTENANCE_GB=$(( TOTAL_RAM_GB * 5 / 100 ))
 if [ $PG_MAINTENANCE_GB -lt 2 ]; then
     PG_MAINTENANCE_GB=2
 fi
 export PG_MAINTENANCE_WORK_MEM="${PG_MAINTENANCE_GB}GB"
 
 # effective_cache_size: 50-75% of RAM
-PG_CACHE_GB=$(echo "$TOTAL_RAM_GB * 0.6" | bc | awk '{print int($1)}')
+PG_CACHE_GB=$(( TOTAL_RAM_GB * 60 / 100 ))
+[ $PG_CACHE_GB -lt 1 ] && PG_CACHE_GB=1
 export PG_EFFECTIVE_CACHE_SIZE="${PG_CACHE_GB}GB"
 
 # max_wal_size: 4GB standard (can be increased if RAM > 64GB)
@@ -95,12 +112,27 @@ echo ""
 # ============================================================================
 # PHASE 3: CLEANUP AND START SERVICES
 # ============================================================================
+
+# Detect docker-compose command (supports both "docker-compose" and "docker compose")
+if command -v docker-compose &> /dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+elif docker compose version &> /dev/null 2>&1; then
+    DOCKER_COMPOSE="docker compose"
+else
+    echo "❌ Error: Neither 'docker-compose' nor 'docker compose' found"
+    echo "   Please install Docker Compose: https://docs.docker.com/compose/install/"
+    exit 1
+fi
+
+echo "   Using: $DOCKER_COMPOSE"
+echo ""
+
 echo "🧹 Cleaning up previous containers..."
-docker-compose down -v 2>/dev/null || true
+$DOCKER_COMPOSE down -v 2>/dev/null || true
 echo ""
 
 echo "🐳 Starting Docker services with maximum resources..."
-docker-compose -f docker-compose.production.yml up -d
+$DOCKER_COMPOSE up -d
 
 echo ""
 echo "⏳ Waiting for services to start..."
@@ -189,29 +221,24 @@ fi
 echo ""
 
 # ============================================================================
-# PHASE 5: VERIFY PYTHON ENVIRONMENT
+# PHASE 5: VERIFY .ENV FILE
 # ============================================================================
-echo "🐍 Verifying Python environment..."
+echo "📝 Verifying environment configuration..."
 
-# Check if venv exists
-if [ -d ".venv" ]; then
-    echo "   ✓ Virtual environment found"
-    source .venv/bin/activate
+if [ ! -f ".env" ]; then
+    echo "   ⚠️  .env file not found"
+    echo "   Creating .env from .env.example..."
+    cp .env.example .env
+    echo "   ✓ .env file created"
+    echo "   ℹ️  Please review .env and adjust values if needed"
 else
-    echo "   ⚠️  Virtual environment not found"
-    echo "   Creating virtual environment..."
-    python3 -m venv .venv
-    source .venv/bin/activate
-
-    echo "   Installing dependencies..."
-    pip install -q --upgrade pip
-    pip install -q -r requirements.txt
+    echo "   ✓ .env file found"
 fi
 
 echo ""
 
 # ============================================================================
-# PHASE 6: RUN BENCHMARK
+# PHASE 6: BUILD AND RUN BENCHMARK CONTAINER
 # ============================================================================
 echo "=========================================="
 echo "🔥 STARTING BENCHMARK - MAXIMUM PERFORMANCE"
@@ -223,11 +250,11 @@ echo "   - RAM: ${TOTAL_RAM_GB}GB"
 echo "   - KeyDB: $KEYDB_MEMORY (${KEYDB_THREADS} threads)"
 echo "   - PostgreSQL: ${PG_SHARED_BUFFERS} shared_buffers"
 echo ""
-echo "Press CTRL+C to stop..."
+echo "📦 Building and running benchmark container..."
 echo ""
 
-# Run the benchmark
-python3 main.py
+# Build and run the benchmark container
+$DOCKER_COMPOSE up --build benchmark
 
 # ============================================================================
 # PHASE 7: CLEANUP (optional)
@@ -242,10 +269,10 @@ read -p "Stop Docker services? [y/N] " -n 1 -r
 echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🧹 Cleaning up services..."
-    docker-compose down
+    $DOCKER_COMPOSE down
     echo "   ✓ Services stopped"
 else
-    echo "   ℹ️  Services still running. To stop: docker-compose down"
+    echo "   ℹ️  Services still running. To stop: $DOCKER_COMPOSE down"
 fi
 
 echo ""

@@ -3,45 +3,59 @@
 Performance benchmark for SHA256 hash computation and write operations on KeyDB/PostgreSQL using Italian tax codes (Codice Fiscale).
 
 **Key Features**:
+- **Fully containerized**: Python benchmark runs in Docker (no local setup required)
 - Scalable to **65M+ records** with constant RAM usage (~32MB per mega-batch)
-- Production-safe: **Always uses LOGGED tables**
+- Production-safe: **LOGGED tables** + **KeyDB persistence** (RDB + AOF)
 - Parallel hash computation and database writes
 - Independent benchmarks with separate data flows
+- Configuration via `.env` file
 
 ---
 
 ## Quick Start
 
-### Automated Execution
+### Automated Execution (Recommended)
 
 ```bash
-# Use the automated script
+# Use the automated script (handles everything automatically)
 ./run_benchmark.sh
 ```
 
+The script will:
+- Detect system resources (CPU, RAM)
+- Configure optimal parameters for KeyDB and PostgreSQL
+- Create `.env` file from `.env.example` if not present
+- Start KeyDB and PostgreSQL containers
+- Build and run the benchmark container
+- Display results
+
 ### Manual Execution
 
-1. **Install Python dependencies**:
+1. **Configure environment** (optional):
 ```bash
-pip install -r requirements.txt
+# Copy example configuration
+cp .env.example .env
+
+# Edit .env to customize parameters (optional)
+nano .env
 ```
 
-2. **Start Docker containers**:
+2. **Start all services**:
 ```bash
-docker-compose up -d
+docker-compose up --build
 ```
 
-3. **Run the benchmark**:
-```bash
-python main.py
-```
+This will:
+- Start KeyDB with persistence enabled
+- Start PostgreSQL with optimized settings
+- Build and run the benchmark Python container
 
-4. **Cleanup** (when done):
+3. **Cleanup** (when done):
 ```bash
-# Stop containers
+# Stop all containers
 docker-compose down
 
-# Stop and delete data
+# Stop and delete all data (including KeyDB/PostgreSQL volumes)
 docker-compose down -v
 ```
 
@@ -153,7 +167,26 @@ CREATE TABLE codici_fiscali (
 
 ## Configuration
 
+### Configuration File (.env)
+
+The benchmark uses a `.env` file for configuration. All parameters are optional with sensible defaults.
+
+**Setup**:
+```bash
+# Copy the example configuration
+cp .env.example .env
+
+# Edit values as needed
+nano .env
+```
+
+The `.env` file is automatically mounted into the benchmark container and loaded via `python-dotenv`.
+
+**Note**: The automated script `run_benchmark.sh` creates `.env` from `.env.example` automatically if it doesn't exist.
+
 ### Environment Variables
+
+All configuration parameters can be set in `.env` or passed as environment variables.
 
 #### Connection Parameters
 
@@ -201,24 +234,20 @@ RUN_POSTGRES_SALT_UPDATE=true    # Benchmark 5 (salt rotation)
 
 ### Example: Custom Configuration
 
+Edit `.env` file for production-like configuration:
+
 ```bash
-# Production-like configuration
-TOTAL_IDS=10000000 \
-POSTGRES_HOST=pg.example.com \
-POSTGRES_USER=cf_user \
-POSTGRES_PASSWORD=secure_pass \
-CF_HASH_SALT="production_salt_2025" \
-python main.py
+# .env file
+TOTAL_IDS=10000000
+POSTGRES_HOST=pg.example.com
+POSTGRES_USER=cf_user
+POSTGRES_PASSWORD=secure_pass
+CF_HASH_SALT=production_salt_2025
 ```
 
-### Example: Quick Test (100k records, KeyDB only)
-
+Then run:
 ```bash
-TOTAL_IDS=100000 \
-RUN_POSTGRES_CF_WRITE=false \
-RUN_POSTGRES_INSERT=false \
-RUN_POSTGRES_SALT_UPDATE=false \
-python main.py
+docker-compose up --build benchmark
 ```
 
 ---
@@ -309,12 +338,100 @@ hash = SHA256(tax_code + salt).hexdigest()
 
 ## Docker Compose Configuration
 
+The benchmark uses Docker Compose to orchestrate three services:
+
+1. **keydb**: High-performance in-memory database with persistence
+2. **postgres**: Relational database for structured data storage
+3. **benchmark**: Python application container that runs the benchmark
+
+All services use `network_mode: host` for optimal performance (services accessible at localhost).
+
+### Benchmark Container
+
+The Python benchmark runs in a containerized environment:
+
+```yaml
+benchmark:
+  build:
+    context: .
+    dockerfile: Dockerfile
+  container_name: cf_benchmark
+  depends_on:
+    - keydb
+    - postgres
+  network_mode: host
+  volumes:
+    - ./.env:/app/.env:ro  # Mount .env as read-only
+  restart: "no"            # One-shot task
+```
+
+**Benefits of containerization**:
+- ✅ Consistent Python environment across systems
+- ✅ Isolated dependencies (no conflicts with system Python)
+- ✅ Easy deployment and reproducibility
+- ✅ No manual virtual environment setup required
+
+**Image details**:
+- Base: `python:3.11-slim`
+- Dependencies: `redis`, `psycopg2-binary`, `python-dotenv`
+- Size: ~200MB
+
 ### KeyDB Settings
 
 ```bash
 export KEYDB_MEMORY=16gb    # Max memory
 export KEYDB_THREADS=8      # Server threads
 ```
+
+#### KeyDB Persistence (Production Mode)
+
+KeyDB uses **dual persistence** mechanisms to ensure data safety in production:
+
+**1. RDB (Redis Database) - Periodic Snapshots**
+
+Creates binary snapshots of the entire dataset at configured intervals:
+
+```yaml
+--save "900 1"     # Save after 15 min if ≥1 key changed
+--save "300 10"    # Save after 5 min if ≥10 keys changed
+--save "60 10000"  # Save after 1 min if ≥10k keys changed
+```
+
+- **File**: `/data/dump.rdb` (stored in Docker volume `keydb_data`)
+- **Pros**: Fast recovery, compact file size
+- **Cons**: Potential data loss of last N seconds if crash occurs between snapshots
+
+**2. AOF (Append-Only File) - Operation Log**
+
+Logs every write operation to a persistent file:
+
+```yaml
+--appendonly yes        # Enable AOF logging
+--appendfsync everysec  # Sync to disk every second
+```
+
+- **File**: `/data/appendonly.aof` (stored in Docker volume `keydb_data`)
+- **Sync Strategy**: `everysec` (good balance between performance and safety)
+  - `always`: Sync after every write (safest, slowest)
+  - `everysec`: Sync every second (recommended, max 1s data loss)
+  - `no`: Let OS decide when to sync (fastest, risky)
+- **Pros**: Minimal data loss (max 1 second with `everysec`)
+- **Cons**: Larger file size, slightly slower writes
+
+**Why Persistence for Benchmarks?**
+
+For **production benchmarks**, persistence must be enabled to:
+- ✅ Simulate real production conditions (not theoretical max performance)
+- ✅ Measure realistic write throughput with durability overhead
+- ✅ Ensure benchmark results match production deployment
+- ✅ Protect critical data (CF → hash mappings cannot be regenerated without original data)
+
+**Performance Impact**: Persistence reduces write throughput by ~2-3x compared to in-memory-only mode, but this is the **realistic production performance**.
+
+**Data Safety**: With dual persistence (RDB + AOF), data survives:
+- Container restarts
+- System crashes
+- Power failures (max 1 second data loss with `everysec`)
 
 ### PostgreSQL Settings
 
@@ -400,17 +517,23 @@ docker-compose up -d
 
 ### Production Safety
 
-✅ **Always uses LOGGED tables** - Tables defined in `init.sql` are production-safe
-✅ **Configurable salts** - Use environment variables for different environments
-✅ **Independent benchmarks** - Can enable/disable via flags
-✅ **Constant memory usage** - Mega-batch architecture scales to 65M+ records
+✅ **Always uses LOGGED tables**
+Tables defined in `init.sql` are production-safe
 
-### Scalability
+✅ **KeyDB persistence enabled**
+Dual persistence (RDB + AOF) in production mode
 
-The mega-batch architecture ensures:
-- **Constant memory usage** (~32MB per batch) regardless of total dataset
-- **Tested up to 65M records**
-- **Linear scaling** with dataset size
+✅ **Configurable via .env**
+All parameters centralized in `.env` file
+
+✅ **Independent benchmarks**
+Can enable/disable via flags
+
+✅ **Constant memory usage**
+Mega-batch architecture scales to 65M+ records
+
+✅ **Containerized execution**
+Consistent environment across all systems
 
 ---
 
@@ -433,9 +556,23 @@ If you encounter OOM errors:
 ### Connection Errors
 
 1. Verify Docker containers are running: `docker ps`
-2. Check PostgreSQL logs: `docker logs cf_postgres`
-3. Check KeyDB logs: `docker logs cf_keydb`
-4. Verify network connectivity: `nc -zv localhost 5432`
+2. Check PostgreSQL logs: `docker logs cf_postgres_prod`
+3. Check KeyDB logs: `docker logs cf_keydb_prod`
+4. Check benchmark logs: `docker logs cf_benchmark`
+5. Verify network connectivity: `nc -zv localhost 5432`
+
+### Container Build Errors
+
+1. Ensure `.env` file exists: `test -f .env && echo "OK" || cp .env.example .env`
+2. Clean Docker cache: `docker-compose build --no-cache benchmark`
+3. Check Docker disk space: `docker system df`
+4. Prune unused images: `docker image prune -a`
+
+### Configuration Issues
+
+1. Verify `.env` file syntax: `cat .env | grep -v '^#' | grep -v '^$'`
+2. Check for missing variables: `diff <(grep -o '^[A-Z_]*=' .env.example | sort) <(grep -o '^[A-Z_]*=' .env | sort)`
+3. Reset to defaults: `cp .env.example .env`
 
 ---
 
