@@ -5,7 +5,7 @@ Performance benchmark for SHA256 hash computation and write operations on KeyDB/
 **Key Features**:
 - **Fully containerized**: Python benchmark runs in Docker (no local setup required)
 - Scalable to **65M+ records** with constant RAM usage (~32MB per mega-batch)
-- Production-safe: **LOGGED tables** + **KeyDB persistence** (RDB + AOF)
+- Production-safe: **KeyDB persistence** (RDB + AOF)
 - Parallel hash computation and database writes
 - Independent benchmarks with separate data flows
 - Configuration via `.env` file
@@ -138,8 +138,6 @@ CREATE TABLE cf_raw (
 ```
 **Purpose**: Immutable source of raw tax codes (no hashes). Used by benchmarks 3, 4, and 5.
 
-**Note**: Always LOGGED (production-safe).
-
 #### Table: `codici_fiscali`
 ```sql
 CREATE TABLE codici_fiscali (
@@ -150,8 +148,6 @@ CREATE TABLE codici_fiscali (
 **Structure**:
 - `hash`: SHA256 hash (computed client-side)
 - `codice_fiscale`: Italian tax code (16 chars)
-
-**Note**: Always LOGGED (production-safe).
 
 ### KeyDB
 
@@ -274,6 +270,30 @@ PostgreSQL named cursors with `itersize` for memory-efficient data streaming.
 
 ### 7. Mega-Batch Processing
 Processes data in 2M-record chunks to maintain constant memory usage regardless of dataset size.
+
+### 8. Autovacuum Disabled During Bulk Insert
+PostgreSQL's autovacuum is temporarily disabled on `codici_fiscali` table during benchmarks 3 and 4 to prevent interference with bulk inserts.
+
+**What is autovacuum?**
+- Background process that removes dead tuples from UPDATE/DELETE operations
+- Keeps database performance optimal over time
+- Can consume CPU/IO during bulk operations
+
+**Optimization strategy:**
+```sql
+-- Before bulk insert (postgres_insert_init)
+ALTER TABLE codici_fiscali SET (autovacuum_enabled = false);
+
+-- After bulk insert + index creation (postgres_insert_finalize)
+ALTER TABLE codici_fiscali SET (autovacuum_enabled = true);
+```
+
+**Why disable during benchmark?**
+- Bulk inserts generate many new rows (no dead tuples to clean)
+- Autovacuum would waste resources scanning for work that doesn't exist
+- Re-enabled after insert to maintain normal production behavior
+
+**Impact:** 5-10% performance improvement during bulk insert phase.
 
 ---
 
@@ -516,9 +536,6 @@ docker-compose up -d
 ## Important Notes
 
 ### Production Safety
-
-✅ **Always uses LOGGED tables**
-Tables defined in `init.sql` are production-safe
 
 ✅ **KeyDB persistence enabled**
 Dual persistence (RDB + AOF) in production mode

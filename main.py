@@ -56,8 +56,6 @@ POSTGRES_DB = os.getenv('POSTGRES_DB', 'cf_benchmark')
 POSTGRES_USER = os.getenv('POSTGRES_USER', 'postgres')
 POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'postgres')
 
-# PostgreSQL optimization: Always use LOGGED tables (safe for production)
-
 # Global Redis connection pool (reuses connections across workers)
 _redis_pool = None
 
@@ -713,7 +711,17 @@ def postgres_insert_init():
 		print(f"   ⚠️  Warning: {e}")
 		conn_admin.rollback()
 
-	# PHASE 3: Set optimal parameters
+	# PHASE 3: Disable autovacuum on codici_fiscali table
+	print("   - Disabling autovacuum on codici_fiscali...")
+	try:
+		cur_admin.execute("ALTER TABLE codici_fiscali SET (autovacuum_enabled = false)")
+		conn_admin.commit()
+		print("   ✓ Autovacuum disabled")
+	except Exception as e:
+		print(f"   ⚠️  Warning: {e}")
+		conn_admin.rollback()
+
+	# PHASE 4: Set optimal parameters
 	print("   - Configuring optimal parameters...")
 	cur_admin.execute("SET maintenance_work_mem = '2GB'")
 	print("   ✓ Parameters configured")
@@ -751,7 +759,17 @@ def postgres_insert_finalize(cur_admin, conn_admin) -> float:
 		conn_admin.rollback()
 		index_time = 0
 
-	# PHASE 2: ANALYZE
+	# PHASE 2: Re-enable autovacuum on codici_fiscali table
+	print("   - Re-enabling autovacuum on codici_fiscali...")
+	try:
+		cur_admin.execute("ALTER TABLE codici_fiscali SET (autovacuum_enabled = true)")
+		conn_admin.commit()
+		print("   ✓ Autovacuum re-enabled")
+	except Exception as e:
+		print(f"   ⚠️  Warning: {e}")
+		conn_admin.rollback()
+
+	# PHASE 3: ANALYZE
 	print("   - Executing ANALYZE...")
 	analyze_start_time = time.time()
 	cur_admin.execute("ANALYZE codici_fiscali")

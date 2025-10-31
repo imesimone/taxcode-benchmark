@@ -1,6 +1,6 @@
 -- Database initialization for Italian Tax Code (Codice Fiscale) -> SHA256 benchmark
 
--- Raw tax codes table (production-safe LOGGED table)
+-- Raw tax codes table
 -- This table stores ONLY the tax codes (no hashes) for BENCHMARK 1bis
 -- Used as immutable source data for subsequent benchmarks
 CREATE TABLE IF NOT EXISTS cf_raw (
@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS cf_raw (
 COMMENT ON TABLE cf_raw IS 'Raw Italian tax codes (no hashes) - immutable source data for benchmarks';
 COMMENT ON COLUMN cf_raw.codice_fiscale IS 'Italian tax code (16 alphanumeric characters)';
 
--- Tax codes table with hashes (production-safe LOGGED table)
+-- Tax codes table with hashes
 -- NOTE: Indexes will be created AFTER bulk insert for maximum performance
 CREATE TABLE IF NOT EXISTS codici_fiscali (
     hash VARCHAR(64) PRIMARY KEY,
