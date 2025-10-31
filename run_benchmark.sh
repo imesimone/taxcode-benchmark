@@ -22,24 +22,40 @@ echo ""
 
 # Detect CPU count and RAM based on OS
 if [[ "$OS" == "Darwin" ]]; then
-    # macOS
-    CPU_COUNT=$(sysctl -n hw.ncpu)
+    # macOS - sysctl reports physical cores correctly
+    CPU_COUNT=$(sysctl -n hw.physicalcpu)
     TOTAL_RAM_GB=$(sysctl -n hw.memsize | awk '{print int($1/1024/1024/1024)}')
 elif [[ "$OS" == "Linux" ]]; then
-    # Linux
-    CPU_COUNT=$(nproc)
+    # Linux - detect physical cores (not hyperthreaded)
+    # Method 1: Use lscpu if available (most reliable)
+    if command -v lscpu &> /dev/null; then
+        CPU_COUNT=$(lscpu -p | grep -v '^#' | sort -u -t, -k 2,4 | wc -l)
+    else
+        # Method 2: Parse /proc/cpuinfo (fallback)
+        CPU_COUNT=$(grep -E "^physical id|^core id" /proc/cpuinfo | sort -u | wc -l)
+        # If detection fails, use half of nproc (assume HT is enabled)
+        if [ $CPU_COUNT -eq 0 ]; then
+            CPU_COUNT=$(( $(nproc) / 2 ))
+        fi
+    fi
     TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
 elif [[ "$OS" =~ ^(MINGW|MSYS|CYGWIN) ]]; then
     # Windows (Git Bash, MSYS2, Cygwin)
     echo "   Detected Windows environment"
-    # CPU count from NUMBER_OF_PROCESSORS environment variable
-    CPU_COUNT=${NUMBER_OF_PROCESSORS:-4}
-    # RAM detection using wmic (if available)
+    # Windows - NUMBER_OF_PROCESSORS includes hyperthreading
+    # Use wmic to get physical cores
     if command -v wmic.exe &> /dev/null; then
+        CPU_COUNT=$(wmic.exe cpu get NumberOfCores | sed -n '2p' | tr -d '\r\n ')
+        # If wmic fails or returns 0, fallback to NUMBER_OF_PROCESSORS / 2
+        if [ -z "$CPU_COUNT" ] || [ "$CPU_COUNT" -eq 0 ] 2>/dev/null; then
+            CPU_COUNT=$(( ${NUMBER_OF_PROCESSORS:-4} / 2 ))
+        fi
+        # RAM detection
         TOTAL_RAM_BYTES=$(wmic.exe computersystem get TotalPhysicalMemory | sed -n '2p' | tr -d '\r\n ')
         TOTAL_RAM_GB=$((TOTAL_RAM_BYTES / 1024 / 1024 / 1024))
     else
-        echo "   ⚠️  wmic not available, using default RAM value"
+        echo "   ⚠️  wmic not available, using defaults"
+        CPU_COUNT=$(( ${NUMBER_OF_PROCESSORS:-4} / 2 ))
         TOTAL_RAM_GB=16
     fi
 else
@@ -49,7 +65,13 @@ else
     TOTAL_RAM_GB=16
 fi
 
-echo "   ✓ Available CPUs: $CPU_COUNT"
+# Sanity check: ensure CPU_COUNT is at least 1
+if [ "$CPU_COUNT" -lt 1 ] 2>/dev/null; then
+    echo "   ⚠️  Invalid CPU count detected, using default value"
+    CPU_COUNT=4
+fi
+
+echo "   ✓ Physical CPU cores: $CPU_COUNT"
 echo "   ✓ Total RAM: ${TOTAL_RAM_GB}GB"
 echo ""
 
@@ -224,7 +246,6 @@ echo ""
 # PHASE 5: VERIFY .ENV FILE
 # ============================================================================
 echo "📝 Verifying environment configuration..."
-
 if [ ! -f ".env" ]; then
     echo "   ⚠️  .env file not found"
     echo "   Creating .env from .env.example..."
