@@ -14,7 +14,9 @@ import random
 import string
 import time
 from typing import List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import numpy as np
 from dotenv import load_dotenv
 import psycopg2
 import redis
@@ -44,6 +46,11 @@ CF_PATTERN = 'LLLLLLDDLDDLDDDL'
 # Pre-compute indices for letters and digits
 CF_LETTERS_INDICES = [i for i, c in enumerate(CF_PATTERN) if c == 'L']
 CF_DIGITS_INDICES = [i for i, c in enumerate(CF_PATTERN) if c == 'D']
+
+# Pre-allocated buffer for SHA256 hash computation (optimization)
+# Tax code is always 16 characters, so buffer size is fixed
+_HASH_BUFFER = bytearray(len(SALT.encode('utf-8')) + 16)
+_HASH_BUFFER[:len(SALT.encode('utf-8'))] = SALT.encode('utf-8')
 
 # Connection configuration (configurable via environment variables)
 KEYDB_HOST = os.getenv('KEYDB_HOST', 'localhost')
@@ -103,7 +110,7 @@ def compute_sha256_hash(tax_code: str) -> str:
 	"""
 	Compute SHA256 hash of a tax code with salt.
 
-	Optimized: uses pre-encoded salt and bytearray to avoid multiple allocations
+	Optimized: uses pre-allocated global buffer to avoid memory allocations
 
 	Args:
 		tax_code: The tax code to hash
@@ -111,11 +118,9 @@ def compute_sha256_hash(tax_code: str) -> str:
 	Returns:
 		str: Hexadecimal hash digest
 	"""
-	# Create pre-allocated bytearray to avoid string concatenations
-	data = bytearray(len(SALT_BYTES) + len(tax_code))
-	data[:len(SALT_BYTES)] = SALT_BYTES
-	data[len(SALT_BYTES):] = tax_code.encode('utf-8')
-	return hashlib.sha256(data).hexdigest()
+	# Use pre-allocated global buffer (tax code is always 16 chars)
+	_HASH_BUFFER[len(SALT_BYTES):] = tax_code.encode('utf-8')
+	return hashlib.sha256(_HASH_BUFFER).hexdigest()
 
 
 def generate_tax_code_with_hash_batch_worker(batch_size: int) -> List[Tuple[str, str]]:
@@ -242,6 +247,118 @@ def generate_tax_codes_only(total_ids: int, batch_size: int = 100_000, num_proce
 	print("")
 
 	return elapsed_time, all_tax_codes
+
+
+# NumPy arrays for fast tax code generation
+LETTERS_ARRAY = np.array(list(LETTERS_TUPLE))
+DIGITS_ARRAY = np.array(list(DIGITS_TUPLE))
+
+
+def _pin_numpy_threads():
+	"""
+	Limit internal BLAS/OpenMP threads to avoid oversubscription
+	when launching multiple processes.
+	"""
+	os.environ.setdefault("OMP_NUM_THREADS", "1")
+	os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+	os.environ.setdefault("MKL_NUM_THREADS", "1")
+	os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def _gen_block_numpy(count: int, child_seed: Optional[int]) -> List[str]:
+	"""
+	Generate `count` tax codes in a single process using NumPy.
+
+	Args:
+		count: Number of tax codes to generate
+		child_seed: Seed for reproducibility (None for random)
+
+	Returns:
+		List[str]: List of generated tax codes
+	"""
+	rng = np.random.default_rng(child_seed)
+
+	# Generate matrix: LLLLLLDDLDDLDDDL (6L, 2D, 1L, 2D, 1L, 3D, 1L)
+	mat = np.concatenate((
+		rng.choice(LETTERS_ARRAY, size=(count, 6), shuffle=False),
+		rng.choice(DIGITS_ARRAY, size=(count, 2), shuffle=False),
+		rng.choice(LETTERS_ARRAY, size=(count, 1), shuffle=False),
+		rng.choice(DIGITS_ARRAY, size=(count, 2), shuffle=False),
+		rng.choice(LETTERS_ARRAY, size=(count, 1), shuffle=False),
+		rng.choice(DIGITS_ARRAY, size=(count, 3), shuffle=False),
+		rng.choice(LETTERS_ARRAY, size=(count, 1), shuffle=False)
+	), axis=1)
+
+	# Convert each row to string (e.g., "ABCDEF12G34H567I")
+	return [''.join(row.tolist()) for row in mat]
+
+
+def generate_tax_codes_only_numpy(
+	total_ids: int,
+	seed: Optional[int] = None,
+	workers: Optional[int] = None,
+	min_block: int = 100_000
+) -> Tuple[float, List[str]]:
+	"""
+	Generate tax codes WITHOUT hashing using NumPy (parallel version).
+
+	Much faster than pure Python for large datasets.
+	Uses ProcessPoolExecutor for deterministic parallel execution.
+
+	Args:
+		total_ids: Total number of tax codes to generate
+		seed: Random seed for reproducibility (None for random)
+		workers: Number of parallel workers (defaults to CPU count)
+		min_block: Minimum block size for parallelization
+
+	Returns:
+		Tuple[float, List[str]]: (elapsed_time, all_tax_codes)
+	"""
+	if workers is None:
+		workers = max(1, (os.cpu_count() or 1))
+
+	print("\n" + "=" * 60)
+	print("🧮 BENCHMARK 1: TAX CODE GENERATION (NumPy parallel)")
+	print("=" * 60)
+	print(f"   Total tax codes to generate: {total_ids:,}")
+	print(f"   Workers: {workers}")
+	print("")
+
+	start_time = time.time()
+
+	# Divide into blocks (not too small to avoid IPC overhead)
+	if total_ids <= min_block:
+		blocks = [total_ids]
+	else:
+		nb = max(workers, total_ids // min_block)
+		base = total_ids // nb
+		rem = total_ids % nb
+		blocks = [base + (1 if i < rem else 0) for i in range(nb)]
+		blocks = [b for b in blocks if b > 0]
+
+	# Generate deterministic seeds for each block
+	child_seeds: List[Optional[int]]
+	if seed is None:
+		child_seeds = [None] * len(blocks)
+	else:
+		ss = np.random.SeedSequence(seed)
+		spawned = ss.spawn(len(blocks))
+		child_seeds = [int(s.generate_state(1)[0]) for s in spawned]
+
+	# Parallel execution
+	results: List[str] = []
+	with ProcessPoolExecutor(max_workers=workers, initializer=_pin_numpy_threads) as ex:
+		futures = [ex.submit(_gen_block_numpy, cnt, cs) for cnt, cs in zip(blocks, child_seeds)]
+		for fut in as_completed(futures):
+			block_res = fut.result()
+			results.extend(block_res)
+
+	elapsed_time = time.time() - start_time
+
+	print(f"✅ Completed: {len(results):,} tax codes in {elapsed_time:.2f}s")
+	print(f"   Throughput: {len(results) / max(elapsed_time, 1e-9):,.0f} op/s\n")
+
+	return elapsed_time, results
 
 
 def write_cf_raw_batch_worker(args):
@@ -497,7 +614,7 @@ def write_keydb_batch_worker(args):
 	"""
 	Worker function for KeyDB batch write operations (multiprocessing).
 
-	Optimized: uses Pipeline with 10k batch size + connection pooling
+	Optimized: uses MSET for bulk writes (faster than individual SETs)
 	Computes hashes from tax codes
 
 	Args:
@@ -512,15 +629,16 @@ def write_keydb_batch_worker(args):
 	# Use connection pool to reuse connections across workers
 	r = redis.Redis(connection_pool=get_redis_pool())
 
-	# Use PIPELINE for 10k record batches (best practice for bulk inserts)
-	# transaction=False for maximum performance (eliminates MULTI/EXEC overhead)
-	pipe = r.pipeline(transaction=False)
+	# Compute all hashes first
+	mapping = {}
 	for tax_code in tax_codes:
-		# Compute hash for this tax code
 		hash_val = compute_sha256_hash(tax_code)
 		# KeyDB stores: hash -> tax_code
-		pipe.set(hash_val, tax_code)
-	pipe.execute()
+		mapping[hash_val] = tax_code
+
+	# Use MSET for bulk write (single command, much faster than pipeline with multiple SETs)
+	# MSET atomically sets all key-value pairs in one operation
+	r.mset(mapping)
 
 	return len(tax_codes)
 
@@ -690,13 +808,14 @@ def postgres_insert_init():
 	print("")
 	print("📋 PRE-INSERT PHASE: Table preparation...")
 
-	# PHASE 1: Drop existing indexes
-	print("   - Dropping existing indexes...")
+	# PHASE 1: Drop existing indexes and PRIMARY KEY
+	print("   - Dropping existing indexes and PRIMARY KEY...")
 	try:
 		cur_admin.execute("DROP INDEX IF EXISTS idx_codici_fiscali_cf")
 		cur_admin.execute("ALTER TABLE codici_fiscali DROP CONSTRAINT IF EXISTS codici_fiscali_codice_fiscale_key")
+		cur_admin.execute("ALTER TABLE codici_fiscali DROP CONSTRAINT IF EXISTS codici_fiscali_pkey")
 		conn_admin.commit()
-		print("   ✓ Indexes dropped")
+		print("   ✓ Indexes and PRIMARY KEY dropped")
 	except Exception as e:
 		print(f"   ⚠️  Warning: {e}")
 		conn_admin.rollback()
@@ -743,19 +862,19 @@ def postgres_insert_finalize(cur_admin, conn_admin) -> float:
 	"""
 	finalize_start = time.time()
 
-	# PHASE 1: Recreate indexes
+	# PHASE 1: Recreate PRIMARY KEY
 	print("🔨 POST-INSERT PHASE: Index creation...")
 	index_start_time = time.time()
 
 	try:
-		print("   - Creating UNIQUE constraint on codice_fiscale...")
-		cur_admin.execute("ALTER TABLE codici_fiscali ADD CONSTRAINT codici_fiscali_codice_fiscale_key UNIQUE (codice_fiscale)")
+		print("   - Creating PRIMARY KEY on codice_fiscale...")
+		cur_admin.execute("ALTER TABLE codici_fiscali ADD PRIMARY KEY (codice_fiscale)")
 		conn_admin.commit()
 
 		index_time = time.time() - index_start_time
-		print(f"   ✓ Index created in {index_time:.2f}s")
+		print(f"   ✓ PRIMARY KEY created in {index_time:.2f}s")
 	except Exception as e:
-		print(f"   ✗ Index creation error: {e}")
+		print(f"   ✗ PRIMARY KEY creation error: {e}")
 		conn_admin.rollback()
 		index_time = 0
 
@@ -783,7 +902,7 @@ def postgres_insert_finalize(cur_admin, conn_admin) -> float:
 	return time.time() - finalize_start
 
 
-def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = None, tax_codes: List[str] = None, incremental_mode: bool = False) -> Optional[float]:
+def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = None, tax_codes: List[str] = None, incremental_mode: bool = False, mega_batch_num: int = None) -> Optional[tuple]:
 	"""
 	BENCHMARK 3: PostgreSQL write operations - computes hashes and writes to PostgreSQL.
 
@@ -794,9 +913,10 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 		num_processes: Number of parallel processes (defaults to min(CPU count, 8))
 		tax_codes: List of tax codes (hashes will be computed)
 		incremental_mode: If True, only performs insert (no init/finalize)
+		mega_batch_num: Mega-batch number for logging (when incremental_mode=True)
 
 	Returns:
-		float: Total elapsed time in seconds, or None on error
+		tuple: (total_time, hash_time, insert_time) or None on error
 	"""
 	if num_processes is None:
 		num_processes = min(mp.cpu_count(), 8)
@@ -820,26 +940,49 @@ def benchmark_postgres_insert(batch_size: int = 50_000, num_processes: int = Non
 
 	start_time = time.time()
 
-	# Split data into batches
+	# PHASE 1: Compute hashes
+	hash_start = time.time()
+	chunk_size = max(1, len(tax_codes) // num_processes)
+	chunks = [tax_codes[i:i + chunk_size] for i in range(0, len(tax_codes), chunk_size)]
+
+	with mp.Pool(processes=num_processes) as pool:
+		hash_results = pool.map(compute_hash_batch, chunks)
+
+	hashes = []
+	for result in hash_results:
+		hashes.extend(result)
+
+	hash_time = time.time() - hash_start
+
+	if incremental_mode and mega_batch_num:
+		print(f"   🔢 Mega-batch {mega_batch_num}: Hashed {len(hashes):,} records in {hash_time:.2f}s ({len(hashes) / hash_time:,.0f} hash/s)")
+
+	# PHASE 2: Insert data
+	insert_start = time.time()
+	data_to_insert = list(zip(hashes, tax_codes))
+
+	# Split into batches for parallel COPY
 	batch_data = []
-	for i in range(0, len(tax_codes), batch_size):
-		batch_tax_codes = tax_codes[i:i+batch_size]
-		batch_data.append((batch_tax_codes, i // batch_size))
+	for i in range(0, len(data_to_insert), batch_size):
+		batch = data_to_insert[i:i+batch_size]
+		batch_data.append((batch, i // batch_size))
 
 	chunksize = max(1, len(batch_data) // (num_processes * 8))
 	with mp.Pool(processes=num_processes) as pool:
-		results = pool.map(write_postgres_batch_worker, batch_data, chunksize=chunksize)
+		results = pool.map(write_salt_update_batch_worker, batch_data, chunksize=chunksize)
 
-	insert_time = time.time() - start_time
+	insert_time = time.time() - insert_start
 	total_count = sum(results)
 
-	if not incremental_mode:
-		print(f"✅ Insert completed: {total_count:,} tax codes in {insert_time:.2f}s")
-		print(f"   Throughput: {total_count / insert_time:,.0f} tax codes/sec")
-	else:
-		print(f"   ✓ Processed {total_count:,} records in {insert_time:.2f}s ({total_count / insert_time:,.0f} rec/s)")
+	total_time = time.time() - start_time
 
-	return insert_time
+	if not incremental_mode:
+		print(f"✅ Insert completed: {total_count:,} tax codes in {total_time:.2f}s")
+		print(f"   Throughput: {total_count / total_time:,.0f} tax codes/sec")
+	elif mega_batch_num:
+		print(f"   💾 Mega-batch {mega_batch_num}: Inserted {total_count:,} records in {insert_time:.2f}s ({total_count / insert_time:,.0f} ins/s)")
+
+	return (total_time, hash_time, insert_time)
 
 
 def read_from_codici_fiscali_in_batches(mega_batch_size: int = 2_000_000, fetch_batch_size: int = 500_000):
@@ -1043,6 +1186,19 @@ def benchmark_postgres_salt_update(batch_size: int = 50_000, num_processes: int 
 	return total_time
 
 
+def compute_hash_batch(tax_codes: List[str]) -> List[str]:
+	"""
+	Worker function for computing hashes with SALT (for BENCHMARK 3).
+
+	Args:
+		tax_codes: List of tax codes to hash
+
+	Returns:
+		List of SHA256 hashes computed with SALT
+	"""
+	return [compute_sha256_hash(cf) for cf in tax_codes]
+
+
 def compute_hash_batch_with_new_salt(tax_codes: List[str]) -> List[str]:
 	"""
 	Worker function for computing hashes with NEW_SALT (for BENCHMARK 4).
@@ -1133,8 +1289,8 @@ def main():
 	print(f"Total records: {TOTAL_IDS:,}")
 	print(f"Available CPUs: {mp.cpu_count()}")
 
-	# BENCHMARK 1: Generate tax codes (no hashes)
-	time_generation, all_tax_codes = generate_tax_codes_only(TOTAL_IDS, BATCH_SIZE_COMPUTATION)
+	# BENCHMARK 1: Generate tax codes (no hashes) - using NumPy for speed
+	time_generation, all_tax_codes = generate_tax_codes_only_numpy(TOTAL_IDS)
 
 	# BENCHMARK 1bis: Write tax codes to PostgreSQL cf_raw table (if enabled)
 	time_cf_raw_write = None
@@ -1189,21 +1345,27 @@ def main():
 			time_postgres = None
 		else:
 			time_postgres = 0.0
+			total_hash_time = 0.0
+			total_insert_time = 0.0
 			mega_batch_num = 0
 
 			print("📥 HASH + INSERT PHASE: Computing hashes and writing to PostgreSQL...")
 			for mega_batch in get_tax_codes_in_batches(source, mega_batch_size=MEGA_BATCH_SIZE):
 				mega_batch_num += 1
-				batch_time = benchmark_postgres_insert(BATCH_SIZE_POSTGRES, tax_codes=mega_batch, incremental_mode=True)
-				if batch_time:
-					time_postgres += batch_time
+				result = benchmark_postgres_insert(BATCH_SIZE_POSTGRES, tax_codes=mega_batch, incremental_mode=True, mega_batch_num=mega_batch_num)
+				if result:
+					batch_total, batch_hash, batch_insert = result
+					time_postgres += batch_total
+					total_hash_time += batch_hash
+					total_insert_time += batch_insert
 
 			# Finalize: recreate indexes, ANALYZE
 			finalize_time = postgres_insert_finalize(cur_admin, conn_admin)
 
 			print(f"\n✅ BENCHMARK 3 complete: {mega_batch_num} mega-batches processed")
-			print(f"   Insertion time: {time_postgres:.2f}s")
-			print(f"   Finalization time: {finalize_time:.2f}s")
+			print(f"   Hash computation: {total_hash_time:.2f}s ({TOTAL_IDS / total_hash_time:,.0f} hash/s)")
+			print(f"   Database insertion: {total_insert_time:.2f}s ({TOTAL_IDS / total_insert_time:,.0f} ins/s)")
+			print(f"   Finalization: {finalize_time:.2f}s")
 			print(f"   Total time: {time_postgres + finalize_time:.2f}s")
 
 	# BENCHMARK 4: Salt update + hash recalculation on PostgreSQL (if enabled)

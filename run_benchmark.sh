@@ -149,6 +149,30 @@ fi
 echo "   Using: $DOCKER_COMPOSE"
 echo ""
 
+# ============================================================================
+# ENSURE .env FILE EXISTS (prevent Docker from creating it as directory)
+# ============================================================================
+echo "🔍 Checking .env file..."
+if [ ! -f ".env" ]; then
+    if [ -d ".env" ]; then
+        echo "   ⚠️  .env is a directory! Removing and creating proper file..."
+        rm -rf .env
+    else
+        echo "   ⚠️  .env file not found"
+    fi
+    echo "   Creating .env from .env.example..."
+    cp .env.example .env
+    echo "   ✓ .env file created"
+elif [ -d ".env" ]; then
+    echo "   ⚠️  .env is a directory! Removing and creating proper file..."
+    rm -rf .env
+    cp .env.example .env
+    echo "   ✓ .env file created"
+else
+    echo "   ✓ .env file exists"
+fi
+echo ""
+
 echo "🧹 Cleaning up previous containers..."
 $DOCKER_COMPOSE down -v 2>/dev/null || true
 echo ""

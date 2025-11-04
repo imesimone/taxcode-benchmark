@@ -73,7 +73,6 @@ services:
       -c fsync=on
       -c synchronous_commit=on
       -c full_page_writes=on
-      -c checkpoint_timeout=5min
       -c max_connections=100
       -c effective_io_concurrency=200
       -c wal_buffers=16MB
@@ -86,7 +85,10 @@ services:
     #   Result: No transactions lost on crash, but commits are slower
     # - full_page_writes=on: Writes full pages to WAL after checkpoint
     #   Result: Protection against partial page writes, slightly larger WAL
-    # - checkpoint_timeout=5min: More frequent checkpoints for faster recovery
+    # - checkpoint_timeout: Time between automatic checkpoints (default: 5min)
+    #   Can be increased for bulk operations to reduce I/O overhead
+    # - checkpoint_completion_target: Spread checkpoint I/O (default: 0.9)
+    #   0.9 = spread writes over 90% of checkpoint interval (reduces I/O spikes)
     # - log_min_duration_statement=1000: Log queries slower than 1 second
     #
     # Note: Using network_mode: host, so ports are directly exposed on host

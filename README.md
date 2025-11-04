@@ -497,8 +497,8 @@ export PG_MAX_WAL_SIZE=4GB            # Default: 4GB
 - Influences whether PostgreSQL uses indexes or sequential scans
 
 **`max_wal_size`** (Default: 4GB)
-- Maximum size of Write-Ahead Log before checkpoint is triggered
-- Larger values = less frequent checkpoints (better for bulk inserts)
+- Maximum size of Write-Ahead Log
+- Larger values = better for bulk inserts
 - **Recommendation**: 2-4GB for bulk operations
 - Trade-off: Larger WAL = longer recovery time after crash
 
@@ -506,7 +506,7 @@ export PG_MAX_WAL_SIZE=4GB            # Default: 4GB
 
 For **bulk insert performance** (benchmarks 2, 3, 4):
 - Increase `maintenance_work_mem` to speed up index creation
-- Increase `max_wal_size` to reduce checkpoint frequency
+- Increase `max_wal_size` for better bulk insert performance
 - Increase `shared_buffers` to cache more data during writes
 
 Example for a 32GB RAM system running bulk inserts:
