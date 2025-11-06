@@ -17,17 +17,31 @@ Performance benchmark for SHA256 hash computation and write operations on KeyDB/
 ### Automated Execution (Recommended)
 
 ```bash
-# Use the automated script (handles everything automatically)
-./run_benchmark.sh
+# You must choose the database engine:
+
+# Use KeyDB (fully multi-threaded, best raw performance)
+./run_benchmark.sh --keydb
+
+# Or use Redis (I/O multi-threaded, widely adopted standard)
+./run_benchmark.sh --redis
 ```
 
 The script will:
 - Detect system resources (CPU, RAM)
-- Configure optimal parameters for KeyDB and PostgreSQL
+- Configure optimal parameters for KeyDB/Redis and PostgreSQL
 - Create `.env` file from `.env.example` if not present
-- Start KeyDB and PostgreSQL containers
+- Start KeyDB/Redis and PostgreSQL containers
 - Build and run the benchmark container
 - Display results
+
+**KeyDB vs Redis:**
+- **KeyDB**: Fully multi-threaded (all operations), best performance on multi-core systems
+- **Redis**: Redis 7 with I/O threading enabled (`io-threads`), parallelizes network I/O while keeping main thread single-threaded
+- Both use identical persistence settings (AOF + RDB) and optimized configuration
+- Both configured to use all available CPU cores
+- You **must** explicitly choose one (no default)
+
+**Performance comparison**: KeyDB typically 10-20% faster than Redis with I/O threading, but Redis is more widely adopted in production environments.
 
 ### Manual Execution
 
@@ -42,11 +56,15 @@ nano .env
 
 2. **Start all services**:
 ```bash
+# With KeyDB (default)
 docker-compose up --build
+
+# With Redis instead
+docker-compose -f docker-compose.redis.yml up --build
 ```
 
 This will:
-- Start KeyDB with persistence enabled
+- Start KeyDB/Redis with persistence enabled
 - Start PostgreSQL with optimized settings
 - Build and run the benchmark Python container
 
@@ -85,8 +103,6 @@ Reads from `cf_raw` in mega-batches, computes SHA256 hashes, writes to `codici_f
 Reads from `cf_raw` in mega-batches, recalculates all hashes with `NEW_SALT`, repopulates `codici_fiscali` using TRUNCATE + COPY strategy (10-20x faster than UPDATE).
 
 **Independent execution**: Can run anytime after benchmark 2.
-
----
 
 ## Mega-Batch Architecture
 
@@ -149,15 +165,26 @@ CREATE TABLE codici_fiscali (
 - `hash`: SHA256 hash (computed client-side)
 - `codice_fiscale`: Italian tax code (16 chars)
 
-### KeyDB
+### KeyDB / Redis
 
-**KeyDB** is a high-performance, multi-threaded, Redis-compatible in-memory database. Fully compatible with Redis protocol and commands.
+Both **KeyDB** and **Redis** are in-memory key-value databases optimized for high performance.
 
-**Key-Value structure**:
+**Key-Value structure** (identical for both):
 - **Key**: SHA256 hash (64 chars)
 - **Value**: Tax code (16 chars)
 
-**Why KeyDB**: Multi-threaded architecture provides better performance than Redis on multi-core systems, while maintaining 100% Redis compatibility.
+**Architecture comparison**:
+- **KeyDB**: Fully multi-threaded (all operations parallelized across cores)
+  - Best raw performance on multi-core systems
+  - Fork of Redis maintaining 100% compatibility
+
+- **Redis 7**: Single-threaded main loop + multi-threaded I/O
+  - `io-threads`: Parallelizes network read/write operations
+  - `io-threads-do-reads`: Enables multi-threaded reads
+  - Main command processing remains single-threaded
+  - More conservative, production-proven approach
+
+**This benchmark**: Both are configured with optimal multi-threading settings to leverage all available CPU cores.
 
 ---
 
@@ -214,7 +241,7 @@ TOTAL_IDS=6000000                      # Total tax codes to generate
 MEGA_BATCH_SIZE=2000000                # Records per mega-batch
 BATCH_SIZE_COMPUTATION=100000          # Batch size for generation
 BATCH_SIZE_CF_RAW=50000                # Batch size for cf_raw writes
-BATCH_SIZE_KEYDB=10000                 # Batch size for KeyDB writes
+BATCH_SIZE_KEYDB=50000                 # Batch size for KeyDB/Redis writes (optimized for MSET)
 BATCH_SIZE_POSTGRES=50000              # Batch size for PostgreSQL writes
 BATCH_SIZE_POSTGRES_UPDATE=50000       # Batch size for salt rotation
 ```
@@ -256,22 +283,73 @@ Uses Python `multiprocessing.Pool` to distribute hash computation across all CPU
 ### 2. PostgreSQL COPY FROM STDIN
 Bulk insert using `COPY` protocol (2-5x faster than INSERT statements).
 
-### 3. Index Management
-Drops indexes before bulk insert, recreates after. Dramatically faster for large datasets.
+### 3. DROP/RECREATE PRIMARY KEY for Stable Bulk Insert Performance
+For large bulk inserts (millions of records), the PRIMARY KEY index causes progressive performance degradation as the B-tree grows deeper.
 
-### 4. KeyDB Pipelining
-Batches 10k SET operations in a single pipeline (eliminates network round-trips).
+**Problem**: Throughput degrades significantly during bulk inserts
+- First 5M records: ~167k rec/s
+- Last 5M records: ~64k rec/s (79% slower!)
 
-### 5. Connection Pooling
+**Solution**: Drop PRIMARY KEY before bulk insert, recreate after all data is inserted
+
+**Strategy**:
+```python
+# 1. PRE-INSERT: Drop PRIMARY KEY
+ALTER TABLE codici_fiscali DROP CONSTRAINT IF EXISTS codici_fiscali_pkey;
+
+# 2. INSERT: Bulk load all data (stable ~190-200k rec/s)
+COPY codici_fiscali (hash, codice_fiscale) FROM STDIN;
+
+# 3. POST-INSERT: Recreate PRIMARY KEY in single operation
+ALTER TABLE codici_fiscali ADD PRIMARY KEY (codice_fiscale);
+```
+
+**Impact**:
+- **Stable throughput**: Maintains ~190-200k rec/s across all batches
+- **Faster inserts**: No per-row index overhead during bulk load
+- **One-time cost**: PRIMARY KEY creation takes ~20-40s for 30M records (still faster overall)
+
+**Trade-off**: Table is not queryable during bulk insert (no PRIMARY KEY), but this is acceptable for batch loading scenarios.
+
+### 4. KeyDB MSET Bulk Writes
+Uses Redis `MSET` command to write all key-value pairs in a single atomic operation instead of pipelining individual `SET` commands.
+
+**Before** (Pipeline with multiple SETs):
+```python
+pipe = r.pipeline(transaction=False)
+for hash_val, tax_code in data:
+    pipe.set(hash_val, tax_code)  # 50k individual commands
+pipe.execute()
+```
+
+**After** (Single MSET):
+```python
+mapping = {hash_val: tax_code for hash_val, tax_code in data}
+r.mset(mapping)  # 1 command for 50k pairs
+```
+
+**Impact**: 20-30% faster writes (from ~72k rec/s to ~100k+ rec/s with batch_size=50k).
+
+### 5. NumPy-Based Tax Code Generation
+Uses NumPy vectorized operations for parallel tax code generation, dramatically faster than pure Python loops.
+
+**Impact**: 3-5x faster generation (from ~700k op/s to ~3.6M op/s).
+
+### 6. SHA256 Pre-Allocated Buffer
+Reuses a single `bytearray` buffer for hash computation instead of allocating memory for each hash.
+
+**Impact**: Reduces memory allocations, ~5-10% faster hashing.
+
+### 7. Connection Pooling
 Reuses database connections across workers (reduces connection overhead).
 
-### 6. Server-Side Cursors
+### 8. Server-Side Cursors
 PostgreSQL named cursors with `itersize` for memory-efficient data streaming.
 
-### 7. Mega-Batch Processing
+### 9. Mega-Batch Processing
 Processes data in 2M-record chunks to maintain constant memory usage regardless of dataset size.
 
-### 8. Autovacuum Disabled During Bulk Insert
+### 10. Autovacuum Disabled During Bulk Insert
 PostgreSQL's autovacuum is temporarily disabled on `codici_fiscali` table during benchmarks 3 and 4 to prevent interference with bulk inserts.
 
 **What is autovacuum?**
@@ -403,9 +481,9 @@ export KEYDB_MEMORY=16gb    # Max memory
 export KEYDB_THREADS=8      # Server threads
 ```
 
-#### KeyDB Persistence (Production Mode)
+#### KeyDB/Redis Persistence (Production Mode)
 
-KeyDB uses **dual persistence** mechanisms to ensure data safety in production:
+Both KeyDB and Redis use **dual persistence** mechanisms to ensure data safety in production:
 
 **1. RDB (Redis Database) - Periodic Snapshots**
 

@@ -1329,6 +1329,7 @@ def main():
 	# BENCHMARK 3: Compute hashes + write to PostgreSQL codici_fiscali (if enabled)
 	# Reads independently from source in mega-batches
 	time_postgres = None
+	time_postgres_total = None
 	if RUN_POSTGRES_INSERT:
 		print("\n" + "=" * 60)
 		print("🗄️  BENCHMARK 3: HASH COMPUTATION + POSTGRESQL WRITE")
@@ -1362,11 +1363,14 @@ def main():
 			# Finalize: recreate indexes, ANALYZE
 			finalize_time = postgres_insert_finalize(cur_admin, conn_admin)
 
+			# Calculate total time including finalization
+			time_postgres_total = time_postgres + finalize_time
+
 			print(f"\n✅ BENCHMARK 3 complete: {mega_batch_num} mega-batches processed")
 			print(f"   Hash computation: {total_hash_time:.2f}s ({TOTAL_IDS / total_hash_time:,.0f} hash/s)")
 			print(f"   Database insertion: {total_insert_time:.2f}s ({TOTAL_IDS / total_insert_time:,.0f} ins/s)")
 			print(f"   Finalization: {finalize_time:.2f}s")
-			print(f"   Total time: {time_postgres + finalize_time:.2f}s")
+			print(f"   Total time: {time_postgres_total:.2f}s")
 
 	# BENCHMARK 4: Salt update + hash recalculation on PostgreSQL (if enabled)
 	# Uses mega-batch processing to handle 65M+ records efficiently
@@ -1389,8 +1393,8 @@ def main():
 	if time_keydb:
 		print(f"2️⃣    Hash + KeyDB write:          {time_keydb:8.2f}s  ({TOTAL_IDS/time_keydb:,.0f} op/s)")
 
-	if time_postgres:
-		print(f"3️⃣    Hash + PostgreSQL write:     {time_postgres:8.2f}s  ({TOTAL_IDS/time_postgres:,.0f} op/s)")
+	if time_postgres_total:
+		print(f"3️⃣    Hash + PostgreSQL write:     {time_postgres_total:8.2f}s  ({TOTAL_IDS/time_postgres_total:,.0f} op/s)")
 
 	if time_salt_update:
 		print(f"4️⃣    Salt update (hash recalc):   {time_salt_update:8.2f}s  ({TOTAL_IDS/time_salt_update:,.0f} op/s)")

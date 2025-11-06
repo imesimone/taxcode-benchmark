@@ -1,0 +1,123 @@
+# ============================================================================
+# REDIS MODE (Alternative to KeyDB)
+# ============================================================================
+# This configuration uses Redis instead of KeyDB with the same settings:
+# - PostgreSQL: fsync=on, synchronous_commit=on (safe writes to disk)
+# - Redis: Persistence ENABLED (AOF + RDB snapshots)
+# - Conservative memory/resource settings
+#
+# Usage:
+#   docker-compose -f docker-compose.redis.yml up -d
+#   python main.py
+# ============================================================================
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: cf_redis_prod
+    # Note: Using network_mode: host, so ports are directly exposed on host
+    # Redis will be available at localhost:6379
+    # PRODUCTION configuration: persistence ENABLED for data safety
+    command: >
+      redis-server
+      --maxmemory ${KEYDB_MEMORY:-16gb}
+      --maxmemory-policy allkeys-lru
+      --io-threads ${KEYDB_THREADS:-4}
+      --io-threads-do-reads yes
+      --save "900 1"
+      --save "300 10"
+      --save "60 10000"
+      --appendonly yes
+      --appendfsync everysec
+    # Performance and persistence settings explained:
+    # - --io-threads: Number of I/O threads for network operations (Redis 6+)
+    # - --io-threads-do-reads: Enable multi-threaded reads (improves throughput)
+    # - --save "900 1": Save to disk after 900s if at least 1 key changed
+    # - --save "300 10": Save to disk after 300s if at least 10 keys changed
+    # - --save "60 10000": Save to disk after 60s if at least 10k keys changed
+    # - --appendonly yes: Enable AOF (Append-Only File) for durability
+    # - --appendfsync everysec: Sync AOF to disk every second (good balance)
+    # Result: Multi-threaded I/O improves performance on multi-core systems
+    # Note: Redis main thread is still single-threaded, but I/O is parallelized
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    network_mode: host
+    # Healthcheck enabled for production monitoring
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cf_postgres_prod
+    # Note: Using network_mode: host, so ports are directly exposed on host
+    # PostgreSQL will be available at localhost:5432
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cf_benchmark}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      # Optimize for better performance while maintaining safety
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    command: >
+      postgres
+      -c shared_buffers=${PG_SHARED_BUFFERS:-4GB}
+      -c work_mem=${PG_WORK_MEM:-128MB}
+      -c maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-1GB}
+      -c effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-8GB}
+      -c max_wal_size=${PG_MAX_WAL_SIZE:-2GB}
+      -c fsync=on
+      -c synchronous_commit=on
+      -c full_page_writes=on
+      -c max_connections=100
+      -c effective_io_concurrency=200
+      -c wal_buffers=16MB
+      -c random_page_cost=1.1
+      -c log_min_duration_statement=1000
+    # Safety settings explained:
+    # - fsync=on: Waits for disk write confirmation (SAFE, slower)
+    # - synchronous_commit=on: Waits for WAL write before commit (SAFE)
+    # - full_page_writes=on: Writes full pages after checkpoint (SAFE, prevents corruption)
+    # Result: Data integrity guaranteed, ~10-20% slower on writes
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    network_mode: host
+    # Healthcheck enabled for production monitoring
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Autovacuum can be temporarily disabled in the benchmark via SQL
+
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cf_benchmark
+    depends_on:
+      - redis
+      - postgres
+    network_mode: host
+    volumes:
+      - ./.env:/app/.env:ro
+    environment:
+      # Redis connection (same interface as KeyDB)
+      KEYDB_HOST: localhost
+      KEYDB_PORT: 6379
+      # PostgreSQL connection
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-cf_benchmark}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    command: ["/app/entrypoint.sh"]
+
+volumes:
+  redis_data:
+    name: taxcode-benchmark_redis_data
+  postgres_data:
+    name: taxcode-benchmark_postgres_data

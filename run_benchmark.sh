@@ -6,9 +6,49 @@ set -e  # Exit immediately on error
 # Automatically configures resources for maximum performance
 # ============================================================================
 
+# Parse command line arguments
+COMPOSE_FILE=""
+DB_ENGINE=""
+
+# Check if at least one argument is provided
+if [ $# -eq 0 ]; then
+    echo "❌ Error: Database engine not specified"
+    echo ""
+    echo "Usage: $0 <--redis|--keydb>"
+    echo "  --redis   Use Redis"
+    echo "  --keydb   Use KeyDB"
+    echo ""
+    exit 1
+fi
+
+for arg in "$@"; do
+    case $arg in
+        --redis)
+            COMPOSE_FILE="docker-compose.redis.yml"
+            DB_ENGINE="Redis"
+            shift
+            ;;
+        --keydb)
+            COMPOSE_FILE="docker-compose.yml"
+            DB_ENGINE="KeyDB"
+            shift
+            ;;
+        *)
+            echo "❌ Unknown option: $arg"
+            echo ""
+            echo "Usage: $0 <--redis|--keydb>"
+            echo "  --redis   Use Redis"
+            echo "  --keydb   Use KeyDB"
+            echo ""
+            exit 1
+            ;;
+    esac
+done
+
 echo "=========================================="
 echo "🚀 BENCHMARK: TAX CODE -> SHA256 HASH"
 echo "=========================================="
+echo "   Database Engine: $DB_ENGINE"
 echo ""
 
 # Detect operating system
@@ -174,11 +214,16 @@ fi
 echo ""
 
 echo "🧹 Cleaning up previous containers..."
-$DOCKER_COMPOSE down -v 2>/dev/null || true
+$DOCKER_COMPOSE -f $COMPOSE_FILE down -v 2>/dev/null || true
 echo ""
 
-echo "🐳 Starting Docker services with maximum resources..."
-$DOCKER_COMPOSE up -d
+echo "🐳 Starting Docker services (databases only)..."
+$DOCKER_COMPOSE -f $COMPOSE_FILE up -d postgres
+if [ "$DB_ENGINE" = "Redis" ]; then
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d redis
+else
+    $DOCKER_COMPOSE -f $COMPOSE_FILE up -d keydb
+fi
 
 echo ""
 echo "⏳ Waiting for services to start..."
@@ -190,12 +235,22 @@ sleep 5
 echo ""
 echo "🔍 Checking service availability..."
 
-# Detect container names (supports both benchmark and production modes)
+# Detect container names (supports both KeyDB and Redis)
+REDIS_CONTAINER=$(docker ps --filter "name=cf_redis" --format "{{.Names}}" | head -1)
 KEYDB_CONTAINER=$(docker ps --filter "name=cf_keydb" --format "{{.Names}}" | head -1)
 POSTGRES_CONTAINER=$(docker ps --filter "name=cf_postgres" --format "{{.Names}}" | head -1)
 
-if [ -z "$KEYDB_CONTAINER" ]; then
-    echo "❌ Error: No KeyDB container found"
+# Determine which container is running (Redis or KeyDB)
+if [ -n "$REDIS_CONTAINER" ]; then
+    DB_CONTAINER=$REDIS_CONTAINER
+    DB_CLI="redis-cli"
+    DB_NAME="Redis"
+elif [ -n "$KEYDB_CONTAINER" ]; then
+    DB_CONTAINER=$KEYDB_CONTAINER
+    DB_CLI="keydb-cli"
+    DB_NAME="KeyDB"
+else
+    echo "❌ Error: No Redis or KeyDB container found"
     exit 1
 fi
 
@@ -204,17 +259,17 @@ if [ -z "$POSTGRES_CONTAINER" ]; then
     exit 1
 fi
 
-# Wait for KeyDB
-echo -n "   KeyDB ($KEYDB_CONTAINER): "
+# Wait for Redis/KeyDB
+echo -n "   $DB_NAME ($DB_CONTAINER): "
 MAX_RETRIES=120  # 2 minutes timeout
 for i in $(seq 1 $MAX_RETRIES); do
-    if docker exec $KEYDB_CONTAINER keydb-cli ping 2>/dev/null | grep -q PONG; then
+    if docker exec $DB_CONTAINER $DB_CLI ping 2>/dev/null | grep -q PONG; then
         echo "✓ Ready"
         break
     fi
     if [ $i -eq $MAX_RETRIES ]; then
         echo "✗ TIMEOUT"
-        echo "❌ Error: KeyDB not responding after 2 minutes"
+        echo "❌ Error: $DB_NAME not responding after 2 minutes"
         exit 1
     fi
     sleep 1
@@ -242,13 +297,14 @@ echo ""
 # ============================================================================
 echo "🔍 Verifying PostgreSQL database schema..."
 
-# Check if codici_fiscali table exists
-TABLE_EXISTS=$(docker exec $POSTGRES_CONTAINER psql -U postgres -d cf_benchmark -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'codici_fiscali');" 2>/dev/null || echo "false")
+# Check if both required tables exist
+CF_RAW_EXISTS=$(docker exec $POSTGRES_CONTAINER psql -U postgres -d cf_benchmark -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'cf_raw');" 2>/dev/null || echo "false")
+CODICI_FISCALI_EXISTS=$(docker exec $POSTGRES_CONTAINER psql -U postgres -d cf_benchmark -tAc "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'codici_fiscali');" 2>/dev/null || echo "false")
 
-if [ "$TABLE_EXISTS" = "t" ] || [ "$TABLE_EXISTS" = "true" ]; then
-    echo "   ✓ Table codici_fiscali found"
+if ([ "$CF_RAW_EXISTS" = "t" ] || [ "$CF_RAW_EXISTS" = "true" ]) && ([ "$CODICI_FISCALI_EXISTS" = "t" ] || [ "$CODICI_FISCALI_EXISTS" = "true" ]); then
+    echo "   ✓ Tables cf_raw and codici_fiscali found"
 else
-    echo "   ✗ Table codici_fiscali NOT found"
+    echo "   ✗ Required tables NOT found"
     echo ""
     echo "   Running init.sql..."
 
@@ -299,7 +355,7 @@ echo "📦 Building and running benchmark container..."
 echo ""
 
 # Build and run the benchmark container
-$DOCKER_COMPOSE up --build benchmark
+$DOCKER_COMPOSE -f $COMPOSE_FILE up --build benchmark
 
 # ============================================================================
 # PHASE 7: CLEANUP (optional)
@@ -314,10 +370,10 @@ read -p "Stop Docker services? [y/N] " -n 1 -r
 echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🧹 Cleaning up services..."
-    $DOCKER_COMPOSE down
+    $DOCKER_COMPOSE -f $COMPOSE_FILE down
     echo "   ✓ Services stopped"
 else
-    echo "   ℹ️  Services still running. To stop: $DOCKER_COMPOSE down"
+    echo "   ℹ️  Services still running. To stop: $DOCKER_COMPOSE -f $COMPOSE_FILE down"
 fi
 
 echo ""
